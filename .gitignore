@@ -1,2 +1,5 @@
-image-recognition/data
 .idea
+.vscode
+image-recognition/data/icdr2015
+image-recognition/data/synthtext
+__pycache__
