@@ -1,5 +1,5 @@
 .idea
 .vscode
-image-recognition/data/icdr2015
-image-recognition/data/synthtext
+text-detection/data/raw
+text-detection/data/processed
 __pycache__
