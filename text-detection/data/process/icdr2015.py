@@ -3,7 +3,7 @@ import os
 import numpy as np
 import cv2 as cv
 from tqdm import tqdm
-from utils import resize_image, get_bin_map, get_prob_map, get_thresh_map
+from utils import resize_image, get_maps
 
 TRAIN_IMG_DIR = "../raw/icdr2015/train_images"
 TRAIN_GT_DIR = "../raw/icdr2015/train_gts"
@@ -25,7 +25,8 @@ def process_images(image_paths, gt_paths):
         image = cv.imread(f"{TRAIN_IMG_DIR}/{image_paths[i]}")
         h, w, _ = image.shape
         image = resize_image(image)
-        cv.imwrite(f"../processed/icdr2015/images/image_{str(N).zfill(4)}.jpg", image)
+        cv.imwrite(
+            f"../processed/icdr2015/images/image_{str(N).zfill(4)}.jpg", image)
 
         with open(f"{TRAIN_GT_DIR}/{gt_paths[i]}", encoding="utf-8-sig") as file:
             gt = [line.rstrip().split(",")[:8] for line in file]
@@ -36,23 +37,17 @@ def process_images(image_paths, gt_paths):
         gt *= ratios
 
         size = (640, 640)
-        bin_map = get_bin_map(gt, size)
-        prob_map = get_prob_map(gt, size)
-        thresh_map = get_thresh_map(gt, size)
+        bin_map, thresh_map = get_maps(gt, size)
 
         cv.imwrite(
-            f"../processed/icdr2015/gts/bin_map_{str(N).zfill(4)}.jpg", bin_map.T * 255
-        )
-        cv.imwrite(
-            f"../processed/icdr2015/gts/prob_map_{str(N).zfill(4)}.jpg",
-            prob_map.T * 255,
+            f"../processed/icdr2015/gts/bin_map_{str(N).zfill(4)}.jpg",
+            bin_map * 255,
         )
         cv.imwrite(
             f"../processed/icdr2015/gts/thresh_map_{str(N).zfill(4)}.jpg",
-            thresh_map.T * 255,
+            thresh_map * 255,
         )
         N += 1
-    return i
 
 
 process_images(train_image_paths, train_gt_paths)

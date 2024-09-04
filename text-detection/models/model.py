@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torchvision.ops import FeaturePyramidNetwork
 from torchvision.models.resnet import resnet18
 from torchvision.models.feature_extraction import create_feature_extractor
+import timm
 
 
 class ASF(nn.Module):
@@ -18,7 +19,8 @@ class ASF(nn.Module):
             nn.Conv2d(1, 1, 1, bias=False),
             nn.Sigmoid(),
         )
-        self.attention = nn.Sequential(nn.Conv2d(256, 1, 1, bias=False), nn.Sigmoid())
+        self.attention = nn.Sequential(
+            nn.Conv2d(256, 1, 1, bias=False), nn.Sigmoid())
 
     def forward(self, x):
         attention_inp = self.conv(x)
@@ -34,7 +36,9 @@ class DBNet(nn.Module):
     def __init__(self):
         super().__init__()
 
-        backbone = resnet18()
+        # backbone = resnet18()
+        # backbone = resnet18(weights='DEFAULT')
+        backbone = timm.create_model('resnet18', pretrained=True)
         return_nodes = {
             "layer1": "layer1",
             "layer2": "layer2",
@@ -56,16 +60,43 @@ class DBNet(nn.Module):
             nn.ConvTranspose2d(64, 1, 2, 2),
             nn.Sigmoid(),
         )
+        # self.thresh = nn.Sequential(
+        #     nn.Conv2d(256, 64, 3, padding=1, bias=False),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(),
+        #     nn.ConvTranspose2d(64, 64, 2, 2),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(),
+        #     nn.ConvTranspose2d(64, 1, 2, 2),
+        #     nn.Sigmoid(),
         self.thresh = nn.Sequential(
             nn.Conv2d(256, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 64, 2, 2),
+            nn.ReLU(inplace=True),
+            self._init_upsample(64, 64, smooth=False, bias=False),
             nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 1, 2, 2),
-            nn.Sigmoid(),
-        )
+            nn.ReLU(inplace=True),
+            self._init_upsample(64, 1, smooth=False, bias=False),
+            nn.Sigmoid())
+
+    def _init_upsample(self,
+                       in_channels, out_channels,
+                       smooth=False, bias=False):
+        if smooth:
+            inter_out_channels = out_channels
+            if out_channels == 1:
+                inter_out_channels = in_channels
+            module_list = [
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(in_channels, inter_out_channels, 3, 1, 1, bias=bias)]
+            if out_channels == 1:
+                module_list.append(
+                    nn.Conv2d(in_channels, out_channels,
+                              kernel_size=1, stride=1, padding=1, bias=True))
+
+            return nn.Sequential(module_list)
+        else:
+            return nn.ConvTranspose2d(in_channels, out_channels, 2, 2)
 
     def forward(self, x):
         x = self.body(x)
@@ -82,6 +113,7 @@ class DBNet(nn.Module):
         if not self.training:
             return prob_map
         thresh_map = self.thresh(fuse).squeeze(1)
-        bin_map = 1 / (1 + torch.exp(-50 * (prob_map - thresh_map)))
+        bin_map = 1 / (1 + torch.exp(-20 * (prob_map - thresh_map)))
+        # print(bin_map.min(), bin_map.max(), bin_map.mean())
         res = {"prob_map": prob_map, "thresh_map": thresh_map, "bin_map": bin_map}
         return res
