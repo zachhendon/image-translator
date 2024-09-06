@@ -113,7 +113,7 @@ class DBNet(nn.Module):
         if not self.training:
             return prob_map
         thresh_map = self.thresh(fuse).squeeze(1)
+        thresh_map = thresh_map * (0.7 - 0.3) + 0.3
         bin_map = 1 / (1 + torch.exp(-20 * (prob_map - thresh_map)))
-        # print(bin_map.min(), bin_map.max(), bin_map.mean())
         res = {"prob_map": prob_map, "thresh_map": thresh_map, "bin_map": bin_map}
         return res

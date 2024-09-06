@@ -1,5 +1,4 @@
 import glob
-from data.dataloader import get_loaders
 from model import DBNet
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn import BCELoss, L1Loss
@@ -8,6 +7,7 @@ import os
 import sys
 
 sys.path.append(os.path.abspath(".."))
+from data.dataloader import get_loaders
 
 
 bin_loss_fn = BCELoss()
@@ -73,8 +73,8 @@ def main():
     epochs = 500
 
     model = DBNet().cuda()
-    # checkpoint = torch.load('checkpoints/dbnet_047', weights_only=False)
-    # model.load_state_dict(checkpoint['model_state_dict'])
+    checkpoint = torch.load('checkpoints/dbnet_061', weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
 
     train_loader, val_loader = get_loaders("../data", batch_size=16)
     loss_fn = db_loss

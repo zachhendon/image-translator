@@ -25,7 +25,7 @@ def get_distance(xs, ys, point_1, point_2):
     return result
 
 
-def draw_polygon(polygon, bin_map, thresh_map):
+def draw_polygon(polygon, thresh_map, bin_map, gt_map):
     polygon = polygon.reshape(-1, 2)
     G = Polygon(polygon)
     D = G.area * (1 - 0.4 ** 2) / G.length
@@ -36,8 +36,10 @@ def draw_polygon(polygon, bin_map, thresh_map):
     Gd = Polygon(pco.Execute(D)[0])
 
     Gs = pco.Execute(-D)
+    # print(np.array(Gs).dtype, np.expand_dims(polygon, 0).astype(np.int64).dtype)
     if Gs != []:
         cv.fillPoly(bin_map, np.array(Gs), 1)
+        cv.fillPoly(gt_map, np.expand_dims(polygon, 0).astype(np.int64), 1)
 
     xmin, ymin, xmax, ymax = [int(bound) for bound in Gd.bounds]
 
@@ -71,11 +73,13 @@ def draw_polygon(polygon, bin_map, thresh_map):
 
 def get_maps(gt, size):
     thresh_map = np.zeros(size, dtype=np.float32)
-    bin_map = np.zeros(size, dtype=np.float32)
-    for polygon in gt:
-        draw_polygon(polygon, bin_map, thresh_map)
     thresh_map = thresh_map * (0.7 - 0.3) + 0.3
-    return bin_map, thresh_map
+
+    bin_map = np.zeros(size, dtype=np.float32)
+    gt_map = np.zeros(size, dtype=np.float32)
+    for polygon in gt:
+        draw_polygon(polygon, thresh_map, bin_map, gt_map)
+    return thresh_map, bin_map, gt_map
 
 
 transform = A.Compose([A.Resize(640, 640)])

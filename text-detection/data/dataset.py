@@ -17,9 +17,11 @@ class ICDR2015Dataset(Dataset):
     def __getitem__(self, idx):
         image = cv.imread(
             f"{self.image_dir}/image_{str(idx).zfill(4)}.jpg", cv.IMREAD_UNCHANGED) / 255
-        bin_map = cv.imread(
-            f"{self.gt_dir}/bin_map_{str(idx).zfill(4)}.jpg", cv.IMREAD_UNCHANGED) / 255
         thresh_map = cv.imread(
             f"{self.gt_dir}/thresh_map_{str(idx).zfill(4)}.jpg", cv.IMREAD_UNCHANGED) / 255
-        maps = {'bin_map': bin_map, 'thresh_map': thresh_map}
+        bin_map = cv.imread(
+            f"{self.gt_dir}/bin_map_{str(idx).zfill(4)}.jpg", cv.IMREAD_UNCHANGED) / 255
+        gt_map = cv.imread(
+            f"{self.gt_dir}/gt_map_{str(idx).zfill(4)}.jpg", cv.IMREAD_UNCHANGED) / 255
+        maps = {'thresh_map': thresh_map, 'bin_map': bin_map, 'gt_map': gt_map}
         return image, maps

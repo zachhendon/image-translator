@@ -37,16 +37,21 @@ def process_images(image_paths, gt_paths):
         gt *= ratios
 
         size = (640, 640)
-        bin_map, thresh_map = get_maps(gt, size)
+        thresh_map, bin_map, gt_map = get_maps(gt, size)
 
+        cv.imwrite(
+            f"../processed/icdr2015/gts/thresh_map_{str(N).zfill(4)}.jpg",
+            thresh_map * 255,
+        )
         cv.imwrite(
             f"../processed/icdr2015/gts/bin_map_{str(N).zfill(4)}.jpg",
             bin_map * 255,
         )
         cv.imwrite(
-            f"../processed/icdr2015/gts/thresh_map_{str(N).zfill(4)}.jpg",
-            thresh_map * 255,
+            f"../processed/icdr2015/gts/gt_map_{str(N).zfill(4)}.jpg",
+            gt_map * 255,
         )
+        
         N += 1
 
 
