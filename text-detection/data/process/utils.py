@@ -36,7 +36,6 @@ def draw_polygon(polygon, thresh_map, bin_map, gt_map):
     Gd = Polygon(pco.Execute(D)[0])
 
     Gs = pco.Execute(-D)
-    # print(np.array(Gs).dtype, np.expand_dims(polygon, 0).astype(np.int64).dtype)
     if Gs != []:
         cv.fillPoly(bin_map, np.array(Gs), 1)
         cv.fillPoly(gt_map, np.expand_dims(polygon, 0).astype(np.int64), 1)
@@ -82,7 +81,7 @@ def get_maps(gt, size):
     return thresh_map, bin_map, gt_map
 
 
-transform = A.Compose([A.Resize(640, 640)])
+transform = A.Compose([A.Resize(960, 960)])
 
 
 def resize_image(image):

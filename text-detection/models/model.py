@@ -36,9 +36,9 @@ class DBNet(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # backbone = resnet18()
+        backbone = resnet18()
         # backbone = resnet18(weights='DEFAULT')
-        backbone = timm.create_model('resnet18', pretrained=True)
+        # backbone = timm.create_model('resnet18', pretrained=True)
         return_nodes = {
             "layer1": "layer1",
             "layer2": "layer2",
@@ -109,11 +109,12 @@ class DBNet(nn.Module):
         fuse = torch.cat([p2, p3_up, p4_up, p5_up], 1)
         fuse = self.asf(fuse)
 
+        maps = {}
         prob_map = self.prob(fuse).squeeze(1)
-        if not self.training:
-            return prob_map
-        thresh_map = self.thresh(fuse).squeeze(1)
-        thresh_map = thresh_map * (0.7 - 0.3) + 0.3
-        bin_map = 1 / (1 + torch.exp(-20 * (prob_map - thresh_map)))
-        res = {"prob_map": prob_map, "thresh_map": thresh_map, "bin_map": bin_map}
-        return res
+        maps['prob_map'] = prob_map
+        if self.training:
+            thresh_map = self.thresh(fuse).squeeze(1)
+            maps['thresh_map'] = thresh_map
+            bin_map = 1 / (1 + torch.exp(-20 * (prob_map - thresh_map)))
+            maps['bin_map'] = bin_map
+        return maps

@@ -32,11 +32,11 @@ def process_images(image_paths, gt_paths):
             gt = [line.rstrip().split(",")[:8] for line in file]
         gt = np.array(gt, dtype=np.float32)
         ratios = np.empty(8)
-        ratios[::2] = 640 / w
-        ratios[1::2] = 640 / h
+        ratios[::2] = 960 / w
+        ratios[1::2] = 960 / h
         gt *= ratios
 
-        size = (640, 640)
+        size = (960, 960)
         thresh_map, bin_map, gt_map = get_maps(gt, size)
 
         cv.imwrite(
@@ -51,7 +51,6 @@ def process_images(image_paths, gt_paths):
             f"../processed/icdr2015/gts/gt_map_{str(N).zfill(4)}.jpg",
             gt_map * 255,
         )
-        
         N += 1
 
 
