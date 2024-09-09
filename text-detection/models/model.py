@@ -110,10 +110,10 @@ class DBNet(nn.Module):
         fuse = self.asf(fuse)
 
         maps = {}
-        prob_map = self.prob(fuse).squeeze(1)
+        prob_map = self.prob(fuse)
         maps['prob_map'] = prob_map
         if self.training:
-            thresh_map = self.thresh(fuse).squeeze(1)
+            thresh_map = self.thresh(fuse)
             maps['thresh_map'] = thresh_map
             bin_map = 1 / (1 + torch.exp(-20 * (prob_map - thresh_map)))
             maps['bin_map'] = bin_map

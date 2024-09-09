@@ -22,7 +22,7 @@ def dilate_polygons(polygons):
 
 
 def seg_to_polygons(map):
-    bin_map = (map >= 0.2).astype(np.uint8)
+    bin_map = (map >= 0.2).astype(np.uint8).squeeze()
     contours, _ = cv.findContours(
         bin_map, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
 
