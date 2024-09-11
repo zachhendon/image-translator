@@ -1,18 +1,13 @@
 from torch.utils.data import Dataset
-import cv2 as cv
-import os
 import albumentations as A
-from albumentations.pytorch import ToTensorV2
 import torch
 import torchvision
-from torchvision.transforms import v2
-import torchvision.transforms.functional as TF
-import random
 import lmdb
 import numpy as np
+from torch.utils.data import Dataset
 
 
-class ICDR2015Dataset(torch.utils.data.Dataset):
+class ICDR2015Dataset(Dataset):
     def __init__(self, datadir):
         env = lmdb.open(f'{datadir}/processed/lmdb_dataset', map_size=2**30)
         self.txn = env.begin()
@@ -43,7 +38,7 @@ class ICDR2015Dataset(torch.utils.data.Dataset):
         return images, maps
 
 
-class TransformDataset(torch.utils.data.Dataset):
+class TransformDataset(Dataset):
     def __init__(self, dataset, transform):
         self.dataset = dataset
         self.transform = transform
@@ -68,3 +63,30 @@ class TransformDataset(torch.utils.data.Dataset):
             )).permute(0, 3, 1, 2) / 255
 
         return images, maps
+
+
+class SimpleICDR2015Dataset(Dataset):
+    def __init__(self, datadir):
+        self.env = lmdb.open(
+            f'{datadir}/processed/lmdb_dataset', map_size=2**30)
+
+    def __len__(self):
+        return 1500
+
+    def get_image(self, path):
+        with self.env.begin() as txn:
+            image_bytes = txn.get(path.encode())
+            image_tensor = torch.frombuffer(
+                bytearray(image_bytes), dtype=torch.uint8)
+            image = torchvision.io.decode_jpeg(
+                image_tensor).permute(1, 2, 0).numpy()
+            return image
+
+    def __getitem__(self, id):
+        id = str(id).zfill(4)
+        image = self.get_image(f'icdr2015_image_{id}')
+
+        maps = {}
+        maps['gt_map'] = self.get_image(f'icdr2015_gt_{id}')
+        maps['eroded_map'] = self.get_image(f'icdr2015_eroded_{id}')
+        return image, maps
