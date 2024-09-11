@@ -42,9 +42,9 @@ def process_images(image_paths, gt_paths):
             gt = np.round(gt).astype(np.int64)
 
             gt_map, eroded_map = get_maps(gt, size)
-            encoded_gt_map = bytes(cv.imencode('.jpg', gt_map)[1])
+            encoded_gt_map = bytes(cv.imencode('.jpg', gt_map * 255)[1])
             txn.put(f'icdr2015_gt_{str(N).zfill(4)}'.encode(), encoded_gt_map)
-            encoded_eroded_map = bytes(cv.imencode('.jpg', eroded_map)[1])
+            encoded_eroded_map = bytes(cv.imencode('.jpg', eroded_map * 255)[1])
             txn.put(f'icdr2015_eroded_{str(N).zfill(
                 4)}'.encode(), encoded_eroded_map)
 
