@@ -21,7 +21,7 @@ def get_loaders(datadir, batch_size=16, train=False):
     generator = torch.Generator().manual_seed(42)
     train_dset, val_dset = torch.utils.data.random_split(
         dataset, [0.8, 0.2], generator)
-
+    
     if train:
         train_dset = TransformDataset(train_dset, train_transform)
     else:
