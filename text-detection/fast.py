@@ -136,12 +136,14 @@ class Head(nn.Module):
         return self.conv(x)
 
     def loss(self, out, gt_kernels, gt_texts):
-        loss_kernel = loss_kernel_fn(out, gt_kernels)
+        loss_kernel_old = loss_kernel_fn(out, gt_kernels)
+        loss_kernel = 1 - (2 * (out * gt_kernels).sum()) / (torch.pow(out, 2).sum() + torch.pow(gt_kernels, 2).sum())
 
         pred_text = F.max_pool2d(out, 9, stride=1, padding=4)
-        loss_text = loss_text = loss_text_fn(pred_text, gt_texts)
+        loss_text_old = loss_text = loss_text_fn(pred_text, gt_texts)
+        loss_text = 1 - (2 * (pred_text * gt_texts).sum()) / (torch.pow(pred_text, 2).sum() + torch.pow(gt_texts, 2).sum())
 
-        return loss_kernel + 0.5 * loss_text
+        return loss_kernel + 0.5 * loss_text, loss_kernel_old + 0.5 * loss_text_old
 
 
 def timing_decorator(func):
@@ -199,6 +201,7 @@ class FAST(nn.Module):
 def train_epoch(model, train_loader, optimizer):
     model.train()
     running_loss = 0.0
+    running_loss_old = 0.0
     dataset_size = 0
 
     for images, maps in train_loader:
@@ -210,18 +213,20 @@ def train_epoch(model, train_loader, optimizer):
         batch_size = len(images)
 
         output = model(images, eroded_maps, gt_maps)
-        loss = output["loss"]
+        loss, loss_old = output["loss"]
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item() * batch_size
+        running_loss_old += loss_old.item() * batch_size
         dataset_size += batch_size
-    return running_loss / dataset_size
+    return running_loss / dataset_size, running_loss_old / dataset_size
 
 
 def val_epoch(model, val_loader):
     model.eval()
     running_loss = 0.0
+    running_loss_old = 0.0
     dataset_size = 0
 
     with torch.no_grad():
@@ -233,11 +238,12 @@ def val_epoch(model, val_loader):
             batch_size = len(images)
 
             output = model(images, eroded_maps, gt_maps)
-            loss = output["loss"]
+            loss, loss_old = output["loss"]
 
             running_loss += loss.item() * batch_size
+            running_loss_old += loss_old.item() * batch_size
             dataset_size += batch_size
-    return running_loss / dataset_size
+    return running_loss / dataset_size, running_loss_old / dataset_size
 
 
 def get_run_id():
@@ -251,9 +257,9 @@ def get_run_id():
 
 
 def main():
-    epochs = 25
+    epochs = 250
 
-    train_loader, val_loader = get_loaders("data", batch_size=16)
+    train_loader, val_loader = get_loaders("data", batch_size=16, train=True)
     model = FAST().cuda()
     optimizer = torch.optim.AdamW(model.parameters())
 
@@ -264,8 +270,8 @@ def main():
     # num_checkpoints = 0
     best_loss = float("inf")
     for epoch in range(epochs):
-        train_loss = train_epoch(model, train_loader, optimizer)
-        val_loss = val_epoch(model, val_loader)
+        train_loss, train_loss_old = train_epoch(model, train_loader, optimizer)
+        val_loss, val_loss_old = val_epoch(model, val_loader)
 
         if val_loss < best_loss:
             best_loss = val_loss
@@ -282,9 +288,10 @@ def main():
             # num_checkpoints += 1
 
         print(
-            f"[Epoch {epoch + 1}] | train loss: {train_loss:.4f} | val loss: {val_loss:.4f}"
+            f"[Epoch {epoch + 1}] | train loss: {train_loss:.4f} | train loss old: {train_loss_old:.4f} | val loss: {val_loss:.4f} | val loss old: {val_loss_old:.4f}"
         )
         writer.add_scalars("loss", {"train": train_loss, "val": val_loss}, epoch + 1)
+        writer.add_scalars("loss_old", {"train": train_loss_old, "val": val_loss_old}, epoch + 1)
         writer.flush()
     writer.close()
 
