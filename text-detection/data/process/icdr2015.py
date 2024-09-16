@@ -16,7 +16,7 @@ test_image_paths = sorted(os.listdir(TEST_IMG_DIR))
 test_gt_paths = sorted(os.listdir(TEST_GT_DIR))
 
 N = 0
-size = (960, 960)
+# size = (960, 960)
 
 
 def process_images(image_paths, gt_paths):
@@ -27,7 +27,6 @@ def process_images(image_paths, gt_paths):
         for i in tqdm(range(len(image_paths))):
             image = cv.imread(f"{TRAIN_IMG_DIR}/{image_paths[i]}")
             h, w, _ = image.shape
-            image = resize_image(image)
 
             encoded_image = bytes(cv.imencode('.jpg', image)[1])
             txn.put(f'icdr2015_image_{
@@ -37,14 +36,12 @@ def process_images(image_paths, gt_paths):
                 gt = [line.rstrip().split(",")[:8] for line in file]
             gt = np.array(gt, dtype=np.float32)
             gt = gt.reshape(len(gt), -1, 2)
-            gt[:, :, 0] *= size[0] / w
-            gt[:, :, 1] *= size[1] / h
             gt = np.round(gt).astype(np.int64)
 
             txn.put(f'icdr2015_nbounds_{str(N).zfill(4)}'.encode(), str(len(gt)).encode())
             txn.put(f'icdr2015_bounds_{str(N).zfill(4)}'.encode(), gt)
 
-            gt_map, eroded_map = get_maps(gt, size)
+            gt_map, eroded_map = get_maps(gt, (h, w))
             encoded_gt_map = bytes(cv.imencode('.jpg', gt_map * 255)[1])
             txn.put(f'icdr2015_gt_{str(N).zfill(4)}'.encode(), encoded_gt_map)
             encoded_eroded_map = bytes(cv.imencode('.jpg', eroded_map * 255)[1])

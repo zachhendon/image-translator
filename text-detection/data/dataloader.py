@@ -5,18 +5,36 @@ from albumentations.pytorch import ToTensorV2
 from data.dataset import *
 
 
-train_transform = A.ReplayCompose(
+train_transform = A.Compose(
     [
-        A.Rotate((-10, 10)),
+        A.HorizontalFlip(),
+        A.VerticalFlip(),
+        A.ShiftScaleRotate(),
+        # A.RandomResizedCrop(
+        #     size=(640, 640),
+        #     scale=(0.3, 1.0),
+        #     ratio=(2 / 3, 3 / 2),
+        # ),
         A.RandomResizedCrop(
             size=(640, 640),
-            scale=(0.3, 1.0),
-            ratio=(2 / 3, 3 / 2),
+            scale=(0.7, 1.0),
+            ratio=(3 / 4, 4 / 3),
         ),
+        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.5),
+        A.AdvancedBlur(),
+        A.Sharpen(),
+        A.GaussNoise(p=1.0),
+        A.Normalize(),
         ToTensorV2(),
     ]
 )
-val_transform = A.ReplayCompose([A.Resize(640, 640), ToTensorV2()])
+val_transform = A.Compose(
+    [
+        A.Resize(640, 640),
+        A.Normalize(),
+        ToTensorV2(),
+    ]
+)
 
 
 def get_loaders(datadir, batch_size=16, train=False):

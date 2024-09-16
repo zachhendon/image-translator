@@ -135,13 +135,54 @@ class Head(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
+    def get_unified_focal_loss(self, pred, true):
+        delta = 0.6
+        gamma = 0.5
+        lmd = 0.5
+
+        pt = true * pred + (1 - true) * (1 - pred)
+        L_maF = -delta * true * torch.log(pt + 1e-8) - (1 - delta) * torch.pow(
+            pred + 1e-8, gamma
+        ) * torch.log(pt + 1e-8)
+        L_maF = -delta * pred * torch.log(pt + 1e-8)
+        L_maF = L_maF.mean()
+
+        mTI = (pred * true).sum() / (
+            pred * true
+            + delta * (pred * (1 - true))
+            + (1 - delta) * ((1 - pred) * true)
+        ).sum()
+        L_maFT = (1 - mTI) + torch.pow(1 - mTI + 1e-8, 1 - gamma)
+
+        return lmd * L_maF + (1 - lmd) * L_maFT
+    
+    def get_unified_focal_loss_sym(self, pred, true):
+        delta = 0.6
+        gamma = 0.5
+        lmd = 0.5
+        
+        pt = true * pred + (1 - true) * (1 - pred)
+        L_mF = delta * (1 - pt + 1e-8).pow(gamma) * F.binary_cross_entropy(pred, true, reduction='none')
+        L_mF = L_mF.mean()
+        
+        mTI = (pred * true).sum() / (
+            pred * true
+            + delta * (pred * (1 - true))
+            + (1 - delta) * ((1 - pred) * true)
+        ).sum()
+        L_mFT = (1 - mTI).pow(gamma)
+        
+        return lmd * L_mF + (1 - lmd) * L_mFT
+
     def loss(self, out, gt_kernels, gt_texts):
         loss_kernel_old = loss_kernel_fn(out, gt_kernels)
-        loss_kernel = 1 - (2 * (out * gt_kernels).sum()) / (torch.pow(out, 2).sum() + torch.pow(gt_kernels, 2).sum())
+        # loss_kernel = 1 - (2 * (out * gt_kernels).sum()) / (torch.pow(out, 2).sum() + torch.pow(gt_kernels, 2).sum())
+        loss_kernel = self.get_unified_focal_loss_sym(out, gt_kernels)
 
         pred_text = F.max_pool2d(out, 9, stride=1, padding=4)
         loss_text_old = loss_text = loss_text_fn(pred_text, gt_texts)
-        loss_text = 1 - (2 * (pred_text * gt_texts).sum()) / (torch.pow(pred_text, 2).sum() + torch.pow(gt_texts, 2).sum())
+        # loss_text = 1 - (2 * (pred_text * gt_texts).sum()) / (torch.pow(pred_text, 2).sum() + torch.pow(gt_texts, 2).sum())
+        loss_text = self.get_unified_focal_loss_sym(pred_text, gt_texts)
 
         return loss_kernel + 0.5 * loss_text, loss_kernel_old + 0.5 * loss_text_old
 
@@ -291,7 +332,9 @@ def main():
             f"[Epoch {epoch + 1}] | train loss: {train_loss:.4f} | train loss old: {train_loss_old:.4f} | val loss: {val_loss:.4f} | val loss old: {val_loss_old:.4f}"
         )
         writer.add_scalars("loss", {"train": train_loss, "val": val_loss}, epoch + 1)
-        writer.add_scalars("loss_old", {"train": train_loss_old, "val": val_loss_old}, epoch + 1)
+        writer.add_scalars(
+            "loss_old", {"train": train_loss_old, "val": val_loss_old}, epoch + 1
+        )
         writer.flush()
     writer.close()
 
