@@ -6,6 +6,7 @@ from torchvision.ops import FeaturePyramidNetwork
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import glob
+from tqdm import tqdm
 
 
 class Backbone(nn.Module):
@@ -155,23 +156,27 @@ class Head(nn.Module):
         L_maFT = (1 - mTI) + torch.pow(1 - mTI + 1e-8, 1 - gamma)
 
         return lmd * L_maF + (1 - lmd) * L_maFT
-    
+
     def get_unified_focal_loss_sym(self, pred, true):
         delta = 0.6
         gamma = 0.5
         lmd = 0.5
-        
+
         pt = true * pred + (1 - true) * (1 - pred)
-        L_mF = delta * (1 - pt + 1e-8).pow(gamma) * F.binary_cross_entropy(pred, true, reduction='none')
+        L_mF = (
+            delta
+            * (1 - pt + 1e-8).pow(gamma)
+            * F.binary_cross_entropy(pred, true, reduction="none")
+        )
         L_mF = L_mF.mean()
-        
+
         mTI = (pred * true).sum() / (
             pred * true
             + delta * (pred * (1 - true))
             + (1 - delta) * ((1 - pred) * true)
         ).sum()
         L_mFT = (1 - mTI).pow(gamma)
-        
+
         return lmd * L_mF + (1 - lmd) * L_mFT
 
     def loss(self, out, gt_kernels, gt_texts):
@@ -239,6 +244,38 @@ class FAST(nn.Module):
         return outputs
 
 
+def train_iters(model, train_iter, train_loader, optimizer, scheduler, num_iter):
+    model.train()
+    running_loss = 0.0
+    running_loss_old = 0.0
+    dataset_size = 0
+
+    for _ in range(num_iter):
+        try:
+            images, maps = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            images, maps = next(train_iter)
+
+        images = images.to(dtype=torch.float32, device="cuda")
+        eroded_maps = maps["eroded_maps"].to(dtype=torch.float32, device="cuda")
+        gt_maps = maps["gt_maps"].to(dtype=torch.float32, device="cuda")
+
+        optimizer.zero_grad()
+        batch_size = len(images)
+
+        output = model(images, eroded_maps, gt_maps)
+        loss, loss_old = output["loss"]
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        running_loss += loss.item() * batch_size
+        running_loss_old += loss_old.item() * batch_size
+        dataset_size += batch_size
+    return train_iter, running_loss / dataset_size, running_loss_old / dataset_size
+
+
 def train_epoch(model, train_loader, optimizer):
     model.train()
     running_loss = 0.0
@@ -262,6 +299,35 @@ def train_epoch(model, train_loader, optimizer):
         running_loss_old += loss_old.item() * batch_size
         dataset_size += batch_size
     return running_loss / dataset_size, running_loss_old / dataset_size
+
+
+def val_iters(model, val_iter, val_loader, num_iter):
+    model.eval()
+    running_loss = 0.0
+    running_loss_old = 0.0
+    dataset_size = 0
+
+    with torch.no_grad():
+        for i in range(num_iter):
+            try:
+                images, maps = next(val_iter)
+            except StopIteration:
+                val_iter = iter(val_loader)
+                images, maps = next(val_iter)
+
+            images = images.to(dtype=torch.float32, device="cuda")
+            eroded_maps = maps["eroded_maps"].to(dtype=torch.float32, device="cuda")
+            gt_maps = maps["gt_maps"].to(dtype=torch.float32, device="cuda")
+
+            batch_size = len(images)
+
+            output = model(images, eroded_maps, gt_maps)
+            loss, loss_old = output["loss"]
+
+            running_loss += loss.item() * batch_size
+            running_loss_old += loss_old.item() * batch_size
+            dataset_size += batch_size
+    return val_iter, running_loss / dataset_size, running_loss_old / dataset_size
 
 
 def val_epoch(model, val_loader):
@@ -297,22 +363,79 @@ def get_run_id():
     return f"fast_{str(prev_run_id + 1).zfill(3)}"
 
 
+# def main():
+#     # epochs = 250
+#     max_iters = 1000
+
+#     train_loader, val_loader = get_loaders("data", batch_size=16, train=True)
+#     model = FAST().cuda()
+#     optimizer = torch.optim.AdamW(model.parameters())
+
+#     run_id = get_run_id()
+#     print(f"starting run {run_id}")
+#     writer = SummaryWriter(f"runs/{run_id}")
+
+#     # num_checkpoints = 0
+#     best_loss = float("inf")
+#     iters = 0
+
+#     while iters <
+
+
+#     for epoch in range(epochs):
+#         train_loss, train_loss_old = train_epoch(model, train_loader, optimizer)
+#         val_loss, val_loss_old = val_epoch(model, val_loader)
+
+#         if val_loss < best_loss:
+#             best_loss = val_loss
+#             torch.save(
+#                 {
+#                     "epoch": epoch + 1,
+#                     "model_state_dict": model.state_dict(),
+#                     "optimizer_state_dict": optimizer.state_dict(),
+#                     "train_loss": train_loss,
+#                     "val_loss": val_loss,
+#                 },
+#                 f"models/checkpoints/{run_id}",
+#             )
+#             # num_checkpoints += 1
+
+#         print(
+#             f"[Epoch {epoch + 1}] | train loss: {train_loss:.4f} | train loss old: {train_loss_old:.4f} | val loss: {val_loss:.4f} | val loss old: {val_loss_old:.4f}"
+#         )
+#         writer.add_scalars("loss", {"train": train_loss, "val": val_loss}, epoch + 1)
+#         writer.add_scalars(
+#             "loss_old", {"train": train_loss_old, "val": val_loss_old}, epoch + 1
+#         )
+#         writer.flush()
+#     writer.close()
+
+
 def main():
-    epochs = 250
+    max_iters = 100000
+    num_train_iters = 100
+    num_val_iters = 25
 
     train_loader, val_loader = get_loaders("data", batch_size=16, train=True)
+    train_iter = iter(train_loader)
+    val_iter = iter(val_loader)
+
     model = FAST().cuda()
-    optimizer = torch.optim.AdamW(model.parameters())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max_iters)
 
     run_id = get_run_id()
     print(f"starting run {run_id}")
     writer = SummaryWriter(f"runs/{run_id}")
-
-    # num_checkpoints = 0
     best_loss = float("inf")
-    for epoch in range(epochs):
-        train_loss, train_loss_old = train_epoch(model, train_loader, optimizer)
-        val_loss, val_loss_old = val_epoch(model, val_loader)
+
+    for epoch in range(int(max_iters / num_train_iters)):
+        train_iter, train_loss, train_loss_old = train_iters(
+            model, train_iter, train_loader, optimizer, scheduler, num_train_iters
+        )
+        val_iter, val_loss, val_loss_old = val_iters(
+            model, val_iter, val_loader, num_val_iters
+        )
 
         if val_loss < best_loss:
             best_loss = val_loss
@@ -326,10 +449,9 @@ def main():
                 },
                 f"models/checkpoints/{run_id}",
             )
-            # num_checkpoints += 1
 
         print(
-            f"[Epoch {epoch + 1}] | train loss: {train_loss:.4f} | train loss old: {train_loss_old:.4f} | val loss: {val_loss:.4f} | val loss old: {val_loss_old:.4f}"
+            f"[Epoch {epoch + 1}] | train loss: {train_loss:.4f} | train loss old: {train_loss_old:.4f} | val loss: {val_loss:.4f} | val loss old: {val_loss_old:.4f} | lr: {scheduler.get_last_lr()[0]:.8f}"
         )
         writer.add_scalars("loss", {"train": train_loss, "val": val_loss}, epoch + 1)
         writer.add_scalars(
@@ -337,6 +459,66 @@ def main():
         )
         writer.flush()
     writer.close()
+
+    # for iter in range(max_iters):
+    #     # train iters
+    #     model.train()
+    #     running_loss = 0.0
+    #     running_loss_old = 0.0
+    #     dataset_size = 0
+    #     for _ in range(iter_cp):
+    #         try:
+    #             images, maps = next(train_iter)
+    #         except StopIteration:
+    #             train_iter = iter(train_loader)
+    #             images, maps = next(train_iter)
+
+    #         images = images.to(dtype=torch.float32, device="cuda")
+    #         eroded_maps = maps["eroded_maps"].to(dtype=torch.float32, device="cuda")
+    #         gt_maps = maps["gt_maps"].to(dtype=torch.float32, device="cuda")
+
+    #         optimizer.zero_grad()
+    #         batch_size = len(images)
+
+    #         output = model(images, eroded_maps, gt_maps)
+    #         loss, loss_old = output["loss"]
+    #         loss.backward()
+    #         optimizer.step()
+
+    #         running_loss += loss.item() * batch_size
+    #         running_loss_old += loss_old.item() * batch_size
+    #         dataset_size += batch_size
+
+    #     # val iters
+    #     if iter % val_ratio != 0: continue
+
+    #     model.eval()
+    #     running_loss = 0.0
+    #     running_loss_old = 0.0
+    #     dataset_size = 0
+    #     for _ in range(int(iter_cp) / 5)
+    #         with torch.no_grad():
+    #             try:
+    #                 images, maps = next(val_iter)
+    #             except StopIteration:
+    #                 val_iter = iter(val_loader)
+    #                 images, maps = next(val_iter)
+
+    #             images = images.to(dtype=torch.float32, device="cuda")
+    #             eroded_maps = maps["eroded_maps"].to(dtype=torch.float32, device="cuda")
+    #             gt_maps = maps["gt_maps"].to(dtype=torch.float32, device="cuda")
+
+    #             batch_size = len(images)
+
+    #             output = model(images, eroded_maps, gt_maps)
+    #             loss, loss_old = output["loss"]
+
+    #             running_loss += loss.item() * batch_size
+    #             running_loss_old += loss_old.item() * batch_size
+    #             dataset_size += batch_size
+    #     print(
+    #         f"[Iter {}]"
+    #     )
 
 
 if __name__ == "__main__":

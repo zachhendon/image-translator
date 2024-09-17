@@ -25,22 +25,24 @@ train_transform = A.Compose(
         A.Sharpen(),
         A.GaussNoise(p=1.0),
         A.Normalize(),
-        ToTensorV2(),
+        # ToTensorV2(),
     ]
 )
 val_transform = A.Compose(
     [
         A.Resize(640, 640),
         A.Normalize(),
-        ToTensorV2(),
+        # ToTensorV2(),
     ]
 )
 
 
 def get_loaders(datadir, batch_size=16, train=False):
-    dataset = ICDR2015Dataset(datadir)
+    # dataset = ICDR2015Dataset(datadir)
+    dataset = SynthtextDataset(datadir)
     generator = torch.Generator().manual_seed(42)
-    train_dset, val_dset = torch.utils.data.random_split(dataset, [0.8, 0.2], generator)
+    # train_dset, val_dset = torch.utils.data.random_split(dataset, [0.8, 0.2], generator)
+    train_dset, val_dset = torch.utils.data.random_split(dataset, [0.9, 0.1], generator)
 
     if train:
         train_dset = TransformDataset(train_dset, train_transform)

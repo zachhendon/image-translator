@@ -9,22 +9,30 @@ transform = A.Compose([A.Resize(960, 960)])
 
 
 def get_maps(gt, size):
-    gt_map = np.zeros(size, dtype=np.float32)
-    gt_map = cv.fillPoly(gt_map, gt, 1)
+    gt_text = np.zeros(size, dtype=np.float32)
+    gt_kernel = np.zeros_like(gt_text)
 
-    eroded_map = np.zeros_like(gt_map)
     for poly in gt:
-        poly_map = np.zeros(size, dtype=np.float32)
-        poly_map = cv.fillPoly(poly_map, np.expand_dims(poly, 0), 1)
+        gt_text_poly = np.zeros(size, dtype=np.float32)
+        gt_text_poly = cv.fillPoly(gt_text_poly, np.expand_dims(poly, 0), 1)
+        gt_text += gt_text_poly 
 
-        eroded_poly_map = -F.max_pool2d(
-            -torch.from_numpy(poly_map).cuda().view(1, 1, *size),
-            9, stride=1, padding=4
-        ).squeeze().cpu().numpy()
-        eroded_map += eroded_poly_map
-    eroded_map = np.clip(eroded_map, 0, 1)
+        gt_kernel_poly = (
+            -F.max_pool2d(
+                -torch.from_numpy(gt_text_poly).cuda().view(1, 1, *size),
+                9,
+                stride=1,
+                padding=4,
+            )
+            .squeeze()
+            .cpu()
+            .numpy()
+        )
+        gt_kernel += gt_kernel_poly 
+    gt_kernel = np.clip(gt_kernel, 0, 1)
+    gt_text = np.clip(gt_text, 0, 1)
 
-    return gt_map, eroded_map
+    return gt_text, gt_kernel 
 
 
 def resize_image(image):
