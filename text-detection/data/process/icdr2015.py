@@ -21,7 +21,7 @@ N = 0
 
 def process_images(image_paths, gt_paths):
     global N
-    env = lmdb.open(f'../processed/lmdb_dataset', map_size=2**30)
+    env = lmdb.open(f'../processed/lmdb_dataset', map_size=150 * 2**30)
 
     with env.begin(write=True) as txn:
         for i in tqdm(range(len(image_paths))):
@@ -35,7 +35,7 @@ def process_images(image_paths, gt_paths):
             with open(f"{TRAIN_GT_DIR}/{gt_paths[i]}", encoding="utf-8-sig") as file:
                 gt = [line.rstrip().split(",")[:8] for line in file]
             gt = np.array(gt, dtype=np.float32)
-            gt = gt.reshape(len(gt), -1, 2)
+            gt = gt.reshape(-1, 4, 2)
             gt = np.round(gt).astype(np.int64)
 
             txn.put(f'icdr2015_nbounds_{str(N).zfill(4)}'.encode(), str(len(gt)).encode())

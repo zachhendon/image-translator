@@ -68,9 +68,9 @@ def get_components(imgs):
     labels = np.array(labels)
     labels = torch.from_numpy(labels).to(dtype=torch.float32)
 
-    for i in range(1, int(labels.max()) + 1):
-        if (labels == i).sum() <= 25:
-            labels[labels == i] = 0
+    # for i in range(1, int(labels.max()) + 1):
+    #     if (labels == i).sum() <= 50:
+    #         labels[labels == i] = 0
 
     labels = labels.cuda()
     labels = F.max_pool2d(labels, 9, stride=1, padding=4)
@@ -107,31 +107,37 @@ def match_bboxes(iou_matrix, pred_ids, gt_ids):
     return matches
 
 
-def get_metrics(pred, eroded_maps):
+def get_gt_labels(bboxes, size):
+    gt_labels = np.zeros(size)
+
+    for i in range(len(bboxes)):
+        for j, bbox in enumerate(bboxes[i]):
+            cv.fillPoly(gt_labels[i], np.expand_dims(bbox, 0).astype(np.int32), j + 1)
+    gt_labels = torch.from_numpy(gt_labels).cuda()
+    return gt_labels
+
+
+def get_metrics(pred, bboxes):
     binary = (pred > 0.5).cpu().numpy().astype(np.uint8).squeeze()
     pred_labels = get_components(binary)
-    eroded_maps = eroded_maps.cpu().numpy().astype(np.uint8).squeeze()
-    gt_labels = get_components(eroded_maps)
+    gt_labels = get_gt_labels(bboxes, pred_labels.shape)
 
     total_precision = 0.0
     total_recall = 0.0
     total_f1 = 0.0
     for i in range(len(binary)):
-        pred_ids = pred_labels[i].unique(sorted=True)[1:].to(dtype=torch.uint8).tolist()
-        gt_ids = gt_labels[i].unique(sorted=True)[1:].to(dtype=torch.uint8).tolist()
+        pred_ids = np.unique(pred_labels[i].cpu())[1:].tolist()
+        gt_ids = np.unique(gt_labels[i].cpu())[1:].tolist()
 
         iou_matrix = get_iou_matrix(pred_labels[i], gt_labels[i], pred_ids, gt_ids)
         matches = match_bboxes(iou_matrix, pred_ids, gt_ids)
 
-        num_pred = len(pred_labels[i].unique()[1:])
-        num_gt = len(gt_labels[i].unique()[1:])
-
         true_positives = len(matches)
-        false_positives = num_pred - true_positives
-        false_negativse = num_gt - true_positives
+        false_positives = len(pred_ids) - true_positives
+        false_negativse = len(gt_ids) - true_positives
 
-        if num_gt == 0:
-            precision = 1 if num_pred == 0 else 0
+        if len(gt_ids) == 0:
+            precision = 1 if len(pred_ids) == 0 else 0
             recall = 1
             f1 = precision
         else:
@@ -171,14 +177,16 @@ def evaluate(model, loader):
     model.eval()
 
     with torch.no_grad():
-        for images, maps in tqdm(loader):
+        for images, labels in tqdm(loader):
             images = images.to(dtype=torch.float32, device="cuda")
-            eroded_maps = maps["eroded_maps"].to(dtype=torch.float32, device="cuda")
-            gt_maps = maps["gt_maps"].to(dtype=torch.float32, device="cuda")
+            gt_kernel = labels["gt_kernel"].to(dtype=torch.float32, device="cuda")
+            gt_text = labels["gt_text"].to(dtype=torch.float32, device="cuda")
+            bboxes = labels["bboxes"]
+
             bach_size = len(images)
 
-            preds = model(images, gt_maps, eroded_maps)["output"]
-            precision, recall, f1 = get_metrics(preds, maps["eroded_maps"])
+            preds = model(images, gt_text, gt_kernel)["output"]
+            precision, recall, f1 = get_metrics(preds, bboxes)
 
             running_precision += precision * bach_size
             running_recall += recall * bach_size

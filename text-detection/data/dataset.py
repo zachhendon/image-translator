@@ -22,26 +22,29 @@ class TransformDataset(Dataset):
             # image=image, masks=[labels["gt_maps"], labels["eroded_maps"]]
             image=image,
             masks=[labels["gt_text"], labels["gt_kernel"]],
+            # keypoints=labels["bboxes"].reshape(-1, 2)
+            # bboxes=labels["bboxes"],
         )
         image = (
             torch.from_numpy(transformed_data["image"].copy()).permute(2, 0, 1).float()
         )
-        labels["gt_maps"] = (
+        labels["gt_text"] = (
             torch.from_numpy(transformed_data["masks"][0].copy())
             .permute(2, 0, 1)
             .float()
         )
-        labels["eroded_maps"] = (
+        labels["gt_kernel"] = (
             torch.from_numpy(transformed_data["masks"][1].copy())
             .permute(2, 0, 1)
             .float()
         )
+        # labels["bboxes"] = transformed_data["keypoints"].reshape(-1, 4, 2)
         return image, labels
 
 
 class ICDR2015Dataset(Dataset):
     def __init__(self, datadir):
-        self.env = lmdb.open(f"{datadir}/processed/lmdb_dataset", map_size=2**30)
+        self.env = lmdb.open(f"{datadir}/processed/lmdb_dataset", map_size=150 * 2**30)
         self.txn = self.env.begin(write=False)
 
     def __len__(self):
@@ -58,8 +61,14 @@ class ICDR2015Dataset(Dataset):
         image = self.get_image(f"icdr2015_image_{id}")
 
         labels = {}
-        labels["gt_maps"] = self.get_image(f"icdr2015_gt_{id}") / 255
-        labels["eroded_maps"] = self.get_image(f"icdr2015_eroded_{id}") / 255
+        labels["gt_text"] = self.get_image(f"icdr2015_gt_{id}") / 255
+        labels["gt_kernel"] = self.get_image(f"icdr2015_eroded_{id}") / 255
+
+        # nbounds = int(self.txn.get(f"icdr2015_nbounds_{id}".encode()))
+        bboxes = np.frombuffer(
+            self.txn.get(f"icdr2015_bounds_{id}".encode()), dtype=np.int64
+        ).reshape(-1, 4, 2).copy()
+        labels["bboxes"] = bboxes
         return image, labels
 
 
@@ -73,6 +82,7 @@ class SynthtextDataset(Dataset):
 
     def __len__(self):
         return 858750
+        # return 1000
 
     def get_image(self, path):
         image_bytes = self.txn.get(path.encode())
@@ -88,4 +98,10 @@ class SynthtextDataset(Dataset):
         labels = {}
         labels["gt_text"] = self.get_image(f"synthtext_text_{id}") / 255
         labels["gt_kernel"] = self.get_image(f"synthtext_kernel_{id}") / 255
+
+        nbounds = int(self.txn.get(f"synthtext_nbounds_{id}".encode()))
+        bounds = np.frombuffer(
+            self.txn.get(f"synthtext_bounds_{id}".encode()), dtype=np.int32
+        ).reshape(nbounds, -1, 2)
+        labels["bboxes"] = bounds
         return image, labels
