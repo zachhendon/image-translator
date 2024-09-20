@@ -5,50 +5,23 @@ from albumentations.pytorch import ToTensorV2
 from data.dataset import *
 
 
-# train_transform = A.Compose(
-#     [
-#         A.HorizontalFlip(),
-#         A.VerticalFlip(),
-#         A.ShiftScaleRotate(),
-#         # A.RandomResizedCrop(
-#         #     size=(640, 640),
-#         #     scale=(0.3, 1.0),
-#         #     ratio=(2 / 3, 3 / 2),
-#         # ),
-#         # A.RandomResizedCrop(
-#         #     size=(640, 640),
-#         #     scale=(0.7, 1.0),
-#         #     ratio=(3 / 4, 4 / 3),
-#         # ),
-#         A.Resize(640, 640),
-#         A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.5),
-#         # A.AdvancedBlur(),
-#         # A.Sharpen(),
-#         A.GaussNoise(p=1.0),
-#         A.Normalize(),
-#         # ToTensorV2(),
-#     ],
-#     keypoint_params=A.KeypointParams(format="xy"),
-# )
-
-
 train_transform = A.Compose(
     [
         A.HorizontalFlip(),
         A.VerticalFlip(),
         A.Affine(
-            scale=(2 / 3, 3 / 2),
+            scale=(3 / 4, 4 / 3),
             translate_percent=(-0.2, 0.2),
-            rotate=(-45, 45),
-            shear=(-10, 10),
+            rotate=(-20, 20),
+            shear=(-20, 20),
             balanced_scale=True,
         ),
         A.RandomResizedCrop(size=(640, 640), scale=(0.9, 1.0), ratio=(2 / 3, 3 / 2)),
+        A.GaussNoise(p=1.0),
+        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
+        A.Sharpen(),
+        A.AdvancedBlur(),
         A.Normalize(),
-        # A.GaussNoise(p=1.0),
-        # A.ColorJitter(brightness=0.1, contrast=0, saturation=0, hue=0),
-        # A.AdvancedBlur(),
-        # A.Sharpen(),
     ],
     # keypoint_params=A.KeypointParams(format="xy"),
 )
@@ -57,9 +30,8 @@ val_transform = A.Compose(
     [
         A.Resize(640, 640),
         A.Normalize(),
-        # ToTensorV2(),
     ],
-    # keypoint_params=A.KeypointParams(format="xy"),
+    keypoint_params=A.KeypointParams(format="xy"),
 )
 
 

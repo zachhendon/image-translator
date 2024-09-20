@@ -19,11 +19,9 @@ class TransformDataset(Dataset):
         image, labels = self.dataset.__getitem__(id)
 
         transformed_data = self.transform(
-            # image=image, masks=[labels["gt_maps"], labels["eroded_maps"]]
             image=image,
             masks=[labels["gt_text"], labels["gt_kernel"]],
             # keypoints=labels["bboxes"].reshape(-1, 2)
-            # bboxes=labels["bboxes"],
         )
         image = (
             torch.from_numpy(transformed_data["image"].copy()).permute(2, 0, 1).float()
@@ -65,9 +63,13 @@ class ICDR2015Dataset(Dataset):
         labels["gt_kernel"] = self.get_image(f"icdr2015_eroded_{id}") / 255
 
         # nbounds = int(self.txn.get(f"icdr2015_nbounds_{id}".encode()))
-        bboxes = np.frombuffer(
-            self.txn.get(f"icdr2015_bounds_{id}".encode()), dtype=np.int64
-        ).reshape(-1, 4, 2).copy()
+        bboxes = (
+            np.frombuffer(
+                self.txn.get(f"icdr2015_bounds_{id}".encode()), dtype=np.int32
+            )
+            .reshape(-1, 4, 2)
+            .copy()
+        )
         labels["bboxes"] = bboxes
         return image, labels
 

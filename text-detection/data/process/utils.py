@@ -3,21 +3,32 @@ import albumentations as A
 import cv2 as cv
 import torch
 import torch.nn.functional as F
+from shapely.geometry import Polygon
 
 
 transform = A.Compose([A.Resize(960, 960)])
 
 
 def get_maps(gt, size):
-    gt_text = np.zeros(size, dtype=np.float32)
+    r = 0.1
+
+    gt_text = np.zeros(size)
     gt_kernel = np.zeros_like(gt_text)
 
-    for poly in gt:
-        gt_text_poly = np.zeros(size, dtype=np.float32)
-        gt_text_poly = cv.fillPoly(gt_text_poly, np.expand_dims(poly, 0), 1)
-        gt_text += gt_text_poly 
+    for bbox in gt:
+        gt_text_poly = np.zeros(size)
+        gt_text_poly = cv.fillPoly(gt_text_poly, np.expand_dims(bbox, 0), 1)
+        gt_text = np.maximum(gt_text, gt_text_poly)
 
-        gt_kernel_poly = (
+        # vatti clipping
+        temp1 = np.zeros_like(gt_kernel)
+        poly = Polygon(bbox)
+        offset = poly.area * (1 - r * r) / poly.length
+        shrink_poly = poly.buffer(-offset)
+        cv.fillPoly(temp1, [np.array(shrink_poly.exterior.coords, dtype=np.int32)], 1)
+
+        # morphological erosion
+        temp2 = (
             -F.max_pool2d(
                 -torch.from_numpy(gt_text_poly).cuda().view(1, 1, *size),
                 9,
@@ -28,11 +39,10 @@ def get_maps(gt, size):
             .cpu()
             .numpy()
         )
-        gt_kernel += gt_kernel_poly 
-    gt_kernel = np.clip(gt_kernel, 0, 1)
-    gt_text = np.clip(gt_text, 0, 1)
 
-    return gt_text, gt_kernel 
+        gt_kernel = np.maximum(gt_kernel, np.maximum(temp1, temp2))
+
+    return gt_text, gt_kernel
 
 
 def resize_image(image):

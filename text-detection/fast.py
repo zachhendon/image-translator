@@ -367,7 +367,7 @@ def get_run_id():
 
 def main():
     epochs = 600
-
+    
     train_loader, val_loader = get_loaders("data", batch_size=16, train=True)
     model = FAST().cuda()
     checkpoint = torch.load('models/checkpoints/fast_366', weights_only=False)
