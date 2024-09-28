@@ -68,9 +68,9 @@ def get_components(imgs):
     labels = np.array(labels)
     labels = torch.from_numpy(labels).to(dtype=torch.float32)
 
-    # for i in range(1, int(labels.max()) + 1):
-    #     if (labels == i).sum() <= 50:
-    #         labels[labels == i] = 0
+    for i in range(1, int(labels.max()) + 1):
+        if (labels == i).sum() <= 10:
+            labels[labels == i] = 0
 
     labels = labels.cuda()
     labels = F.max_pool2d(labels, 9, stride=1, padding=4)
@@ -117,9 +117,29 @@ def get_gt_labels(bboxes, size):
     return gt_labels
 
 
+def blur_image(image):
+    kernel = (
+        torch.tensor(
+            [[[[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]]]], device="cuda"
+        )
+        / 16
+    )
+    return F.conv2d(
+        # torch.from_numpy(image).unsqueeze(1).to(dtype=torch.float32, device="cuda"),
+        image,
+        kernel,
+        stride=1,
+        padding=1,
+    ).cpu().numpy().squeeze()
+
+
 def get_metrics(pred, bboxes):
-    binary = (pred > 0.5).cpu().numpy().astype(np.uint8).squeeze()
+    pred = blur_image(pred)
+    binary = (pred > 0.5).astype(np.uint8)
+    # return binary
+    # binary = cv.connectedComponents(cv.GaussianBlur(binary, (5, 5), 0))
     pred_labels = get_components(binary)
+    # return pred_labels
     gt_labels = get_gt_labels(bboxes, pred_labels.shape)
 
     total_precision = 0.0
@@ -127,6 +147,7 @@ def get_metrics(pred, bboxes):
     total_f1 = 0.0
     for i in range(len(binary)):
         pred_ids = np.unique(pred_labels[i].cpu())[1:].tolist()
+        # print(pred_ids)
         gt_ids = np.unique(gt_labels[i].cpu())[1:].tolist()
 
         iou_matrix = get_iou_matrix(pred_labels[i], gt_labels[i], pred_ids, gt_ids)
@@ -134,7 +155,8 @@ def get_metrics(pred, bboxes):
 
         true_positives = len(matches)
         false_positives = len(pred_ids) - true_positives
-        false_negativse = len(gt_ids) - true_positives
+        false_negatives = len(gt_ids) - true_positives
+        # print(true_positives, false_positives, false_negatives)
 
         if len(gt_ids) == 0:
             precision = 1 if len(pred_ids) == 0 else 0
@@ -149,7 +171,7 @@ def get_metrics(pred, bboxes):
             recall = (
                 0
                 if true_positives == 0
-                else true_positives / (true_positives + false_negativse)
+                else true_positives / (true_positives + false_negatives)
             )
             f1 = (
                 0
@@ -179,14 +201,22 @@ def evaluate(model, loader):
     with torch.no_grad():
         for images, labels in tqdm(loader):
             images = images.to(dtype=torch.float32, device="cuda")
-            gt_kernel = labels["gt_kernel"].to(dtype=torch.float32, device="cuda")
-            gt_text = labels["gt_text"].to(dtype=torch.float32, device="cuda")
+            maps = labels["maps"].to(dtype=torch.float32, device="cuda")
+            gt_kernel = maps[:, 0]
+            gt_text = maps[:, 1]
+            edge_weight = maps[:, 2]
             bboxes = labels["bboxes"]
+            # images = images.to(dtype=torch.float32, device="cuda")
+            # gt_kernel = labels["gt_kernel"].to(dtype=torch.float32, device="cuda")
+            # gt_text = labels["gt_text"].to(dtype=torch.float32, device="cuda")
+            # bboxes = labels["bboxes"]
 
             bach_size = len(images)
 
-            preds = model(images, gt_text, gt_kernel)["output"]
+            preds = model(images, gt_text, gt_kernel, edge_weight)["output"]
+            # return preds, bboxes
             precision, recall, f1 = get_metrics(preds, bboxes)
+            # print(precision, recall, f1)
 
             running_precision += precision * bach_size
             running_recall += recall * bach_size

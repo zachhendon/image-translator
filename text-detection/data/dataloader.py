@@ -7,6 +7,7 @@ from data.dataset import *
 
 train_transform = A.Compose(
     [
+        A.Resize(640, 640),
         A.HorizontalFlip(),
         A.VerticalFlip(),
         A.Affine(
@@ -22,14 +23,16 @@ train_transform = A.Compose(
         A.Sharpen(),
         A.AdvancedBlur(),
         A.Normalize(),
+        ToTensorV2()
     ],
-    # keypoint_params=A.KeypointParams(format="xy"),
+    keypoint_params=A.KeypointParams(format="xy"),
 )
 
 val_transform = A.Compose(
     [
         A.Resize(640, 640),
         A.Normalize(),
+        ToTensorV2()
     ],
     keypoint_params=A.KeypointParams(format="xy"),
 )
@@ -39,8 +42,9 @@ def collate_fn(batch):
     images = torch.stack([x[0] for x in batch])
 
     labels = {}
-    labels["gt_text"] = torch.stack([x[1]["gt_text"] for x in batch])
-    labels["gt_kernel"] = torch.stack([x[1]["gt_kernel"] for x in batch])
+    # labels["gt_text"] = torch.stack([x[1]["gt_text"] for x in batch])
+    # labels["gt_kernel"] = torch.stack([x[1]["gt_kernel"] for x in batch])
+    labels["maps"] = torch.stack([x[1]["maps"] for x in batch])
     labels["bboxes"] = [x[1]["bboxes"] for x in batch]
     return images, labels
 
@@ -76,10 +80,6 @@ def get_loaders(datadir, batch_size=16, train=False):
     )
 
     return train_loader, val_loader
-
-
-def get_loaders2(datadir, batch_size=16, train=False):
-    pass
 
 
 def get_eval_loader(datadir, batch_size=16):
