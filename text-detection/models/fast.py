@@ -75,41 +75,73 @@ class Backbone(nn.Module):
         self.fpn = FeaturePyramidNetwork([64, 128, 256, 512], 64)
 
     def forward(self, x):
-        features = {}
+        # features = {}
         x = self.conv1(x)
-        x = self.stage1(x)
-        features["stage1"] = x
-        x = self.stage2(x)
-        features["stage2"] = x
-        x = self.stage3(x)
-        features["stage3"] = x
-        x = self.stage4(x)
-        features["stage4"] = x
+        x2 = self.stage1(x)
+        # features["stage1"] = x
+        x3 = self.stage2(x2)
+        # features["stage2"] = x
+        x4 = self.stage3(x3)
+        # features["stage3"] = x
+        x5 = self.stage4(x4)
+        # features["stage4"] = x
 
-        return features
+        # return features
+        return x2, x3, x4, x5
 
 
 class Neck(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.reduce2 = nn.Conv2d(64, 128, 3, padding=1, bias=False)
-        self.reduce3 = nn.Conv2d(128, 128, 3, padding=1, bias=False)
-        self.reduce4 = nn.Conv2d(256, 128, 3, padding=1, bias=False)
-        self.reduce5 = nn.Conv2d(512, 128, 3, padding=1, bias=False)
+        # self.reduce2 = nn.Conv2d(64, 128, 3, padding=1, bias=False)
+        # self.reduce3 = nn.Conv2d(128, 128, 3, padding=1, bias=False)
+        # self.reduce4 = nn.Conv2d(256, 128, 3, padding=1, bias=False)
+        # self.reduce5 = nn.Conv2d(512, 128, 3, padding=1, bias=False)
+        self.reduce5 = nn.Conv2d(512, 128, kernel_size=1, bias=False)
+        self.reduce4 = nn.Conv2d(256, 128, kernel_size=1, bias=False)
+        self.reduce3 = nn.Conv2d(128, 128, kernel_size=1, bias=False)
+        self.reduce2 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
+        
+        self.smooth4 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+        self.smooth3 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+        self.smooth2 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+        )
+        
+    def upsample_cat(self, p2, p3, p4, p5):
+        size = p2.size()[2:]
+        # p3 = F.interpolate(p3, size=size, mode="bilinear")
+        # p4 = F.interpolate(p4, size=size, mode="bilinear")
+        # p5 = F.interpolate(p5, size=size, mode="bilinear")
+        p3 = F.interpolate(p3, size=size)
+        p4 = F.interpolate(p4, size=size)
+        p5 = F.interpolate(p5, size=size)
+        return torch.cat([p2, p3, p4, p5], dim=1)
 
     def forward(self, x):
-        c2, c3, c4, c5 = x.values()
+        # c2, c3, c4, c5 = x.values()
+        c2, c3, c4, c5 = x
 
-        p2 = self.reduce2(c2)
-        p3 = self.reduce3(c3)
-        p3 = F.interpolate(p3, scale_factor=2, mode="bilinear")
-        p4 = self.reduce4(c4)
-        p4 = F.interpolate(p4, scale_factor=4, mode="bilinear")
+        # TODO smooth layers
         p5 = self.reduce5(c5)
-        p5 = F.interpolate(p5, scale_factor=8, mode="bilinear")
+        # p4 = F.interpolate(p5, size=c4.size()[2:], mode="bilinear") + self.reduce4(c4)
+        # p3 = F.interpolate(p4, size=c3.size()[2:], mode="bilinear") + self.reduce3(c3)
+        # p2 = F.interpolate(p3, size=c2.size()[2:], mode="bilinear") + self.reduce2(c2)
+        p4 = F.interpolate(p5, size=c4.size()[2:]) + self.reduce4(c4)
+        p4 = self.smooth4(p4)
+        p3 = F.interpolate(p4, size=c3.size()[2:]) + self.reduce3(c3)
+        p3 = self.smooth3(p3)
+        p2 = F.interpolate(p3, size=c2.size()[2:]) + self.reduce2(c2)
+        p2 = self.smooth2(p2)
 
-        p = torch.cat([p2, p3, p4, p5], 1)
+        p = self.upsample_cat(p2, p3, p4, p5)
+        p = self.conv(p)
+        # print(p2.size(), p3.size(), p4.size(), p5.size(), p.size())
         return p
 
 
@@ -133,7 +165,7 @@ class Head(nn.Module):
         )
 
     def forward(self, x):
-        return self.conv(x)
+        return self.conv(x).squeeze(1)
 
     def get_unified_focal_loss_asym(self, pred, true):
         delta = 0.6
@@ -233,8 +265,10 @@ class FAST(nn.Module):
     def run_head(self, x):
         return self.head(x)
 
-    def forward(self, images, gt_kernels, gt_texts, edge_weight):
+    # def forward(self, images, gt_kernels, gt_texts, edge_weight):
+    def forward(self, images):
         outputs = {}
+        size = images.size()[2:]
 
         if self.training:
             x = self.run_backbone(images)
@@ -244,10 +278,10 @@ class FAST(nn.Module):
             x, outputs["backbone_time"] = self.run_backbone(images)
             x, outputs["neck_time"] = self.run_neck(x)
             x, outputs["head_time"] = self.run_head(x)
-            outputs["output"] = x
-        outputs["loss"] = self.head.loss(x, gt_kernels, gt_texts, edge_weight)
+            # outputs["output"] = x
+        # outputs["loss"] = self.head.loss(x, gt_kernels, gt_texts, edge_weight)
 
-        return outputs
+        return x
 
 
 def train_iters(model, train_iter, train_loader, optimizer, scheduler, num_iter):
@@ -368,14 +402,14 @@ def val_epoch(model, val_loader):
     return running_loss / dataset_size, running_loss_old / dataset_size
 
 
-def get_run_id():
-    prev_runs = glob.glob("runs/*")
+def get_run_id(config):
+    prev_runs = glob.glob(f"checkpoints/{config}*")
     if len(prev_runs) == 0:
         prev_run_id = -1
     else:
         prev_run_ids = [int(run[-3:]) for run in prev_runs]
         prev_run_id = sorted(prev_run_ids)[-1]
-    return f"fast_{str(prev_run_id + 1).zfill(3)}"
+    return f"{config}_{str(prev_run_id + 1).zfill(3)}"
 
 
 # def main():

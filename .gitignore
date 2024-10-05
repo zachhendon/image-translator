@@ -5,3 +5,4 @@ text-detection/data/raw
 text-detection/data/processed
 text-detection/models/checkpoints
 text-detection/runs
+checkpoints

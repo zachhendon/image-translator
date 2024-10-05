@@ -8,6 +8,9 @@ import os
 import sys
 sys.path.append(os.path.abspath(".."))
 from data.dataloader import get_loaders
+from tqdm import tqdm
+import time
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 thresh_loss_fn = L1Loss()
@@ -47,7 +50,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, loss_fn):
     running_prob_loss = 0.0
     dataset_size = 0
 
-    for images, maps in train_loader:
+    for images, maps in tqdm(train_loader):
         optimizer.zero_grad()
         batch_size = len(images)
 
@@ -76,7 +79,7 @@ def val_epoch(model, val_loader, loss_fn):
     running_prob_loss = 0.0
     dataset_size = 0
 
-    for images, maps in val_loader:
+    for images, maps in tqdm(val_loader):
         batch_size = len(images)
 
         images = images.to(device='cuda', dtype=torch.float32)

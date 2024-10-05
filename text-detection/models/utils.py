@@ -60,11 +60,10 @@ def get_seg_and_poly(output_maps):
     return gt_polygons, gt_maps
 
 
-def get_components(imgs):
-    labels = []
-    for img in imgs:
-        _, label = cv.connectedComponents(img)
-        labels.append(label)
+def get_components(img):
+    # labels = []
+    _, labels = cv.connectedComponents(img)
+    # labels.append(label)
     labels = np.array(labels)
     labels = torch.from_numpy(labels).to(dtype=torch.float32)
 
@@ -73,7 +72,7 @@ def get_components(imgs):
             labels[labels == i] = 0
 
     labels = labels.cuda()
-    labels = F.max_pool2d(labels, 9, stride=1, padding=4)
+    labels = F.max_pool2d(labels.unsqueeze(0), 9, stride=1, padding=4).squeeze(0)
     return labels
 
 
@@ -110,9 +109,9 @@ def match_bboxes(iou_matrix, pred_ids, gt_ids):
 def get_gt_labels(bboxes, size):
     gt_labels = np.zeros(size)
 
-    for i in range(len(bboxes)):
-        for j, bbox in enumerate(bboxes[i]):
-            cv.fillPoly(gt_labels[i], np.expand_dims(bbox, 0).astype(np.int32), j + 1)
+    for i, bbox in enumerate(bboxes):
+        cv.fillPoly(gt_labels, np.expand_dims(bbox, 0).astype(np.int32), i + 1)
+
     gt_labels = torch.from_numpy(gt_labels).cuda()
     return gt_labels
 
@@ -124,39 +123,41 @@ def blur_image(image):
         )
         / 16
     )
-    return F.conv2d(
-        # torch.from_numpy(image).unsqueeze(1).to(dtype=torch.float32, device="cuda"),
-        image,
-        kernel,
-        stride=1,
-        padding=1,
-    ).cpu().numpy().squeeze()
+
+    return (
+        F.conv2d(
+            image.unsqueeze(0),
+            kernel,
+            stride=1,
+            padding=1,
+        )
+        .cpu()
+        .numpy()
+        .squeeze(0)
+    )
 
 
 def get_metrics(pred, bboxes):
-    pred = blur_image(pred)
-    binary = (pred > 0.5).astype(np.uint8)
-    # return binary
-    # binary = cv.connectedComponents(cv.GaussianBlur(binary, (5, 5), 0))
-    pred_labels = get_components(binary)
-    # return pred_labels
-    gt_labels = get_gt_labels(bboxes, pred_labels.shape)
+    threshold = 0.7
 
     total_precision = 0.0
     total_recall = 0.0
     total_f1 = 0.0
-    for i in range(len(binary)):
-        pred_ids = np.unique(pred_labels[i].cpu())[1:].tolist()
-        # print(pred_ids)
-        gt_ids = np.unique(gt_labels[i].cpu())[1:].tolist()
+    for i in range(len(pred)):
+        binary = (pred[i] > threshold).to(dtype=torch.float32)
+        binary = (blur_image(binary) > 0.1).astype(np.uint8)
+        pred_labels = get_components(binary)
+        gt_labels = get_gt_labels(bboxes[i], pred_labels.shape)
 
-        iou_matrix = get_iou_matrix(pred_labels[i], gt_labels[i], pred_ids, gt_ids)
+        pred_ids = np.unique(pred_labels.cpu())[1:].tolist()
+        gt_ids = np.unique(gt_labels.cpu())[1:].tolist()
+
+        iou_matrix = get_iou_matrix(pred_labels, gt_labels, pred_ids, gt_ids)
         matches = match_bboxes(iou_matrix, pred_ids, gt_ids)
 
         true_positives = len(matches)
         false_positives = len(pred_ids) - true_positives
         false_negatives = len(gt_ids) - true_positives
-        # print(true_positives, false_positives, false_negatives)
 
         if len(gt_ids) == 0:
             precision = 1 if len(pred_ids) == 0 else 0
@@ -183,11 +184,7 @@ def get_metrics(pred, bboxes):
         total_recall += recall
         total_f1 += f1
 
-    return (
-        total_precision / len(binary),
-        total_recall / len(binary),
-        total_f1 / len(binary),
-    )
+    return (total_precision, total_recall, total_f1)
 
 
 def evaluate(model, loader):
@@ -199,33 +196,24 @@ def evaluate(model, loader):
     model.eval()
 
     with torch.no_grad():
-        for images, labels in tqdm(loader):
+        for images, (_, _, kernel_masks, text_masks, bboxes) in loader:
             images = images.to(dtype=torch.float32, device="cuda")
-            maps = labels["maps"].to(dtype=torch.float32, device="cuda")
-            gt_kernel = maps[:, 0]
-            gt_text = maps[:, 1]
-            edge_weight = maps[:, 2]
-            bboxes = labels["bboxes"]
-            # images = images.to(dtype=torch.float32, device="cuda")
-            # gt_kernel = labels["gt_kernel"].to(dtype=torch.float32, device="cuda")
-            # gt_text = labels["gt_text"].to(dtype=torch.float32, device="cuda")
-            # bboxes = labels["bboxes"]
+            kernel_masks = kernel_masks.to(dtype=torch.float32, device="cuda")
+            text_masks = text_masks.to(dtype=torch.float32, device="cuda")
 
-            bach_size = len(images)
+            batch_size = len(images)
 
-            preds = model(images, gt_text, gt_kernel, edge_weight)["output"]
-            # return preds, bboxes
+            preds = model(images)
+            # preds = preds * kernel_masks
+            preds = preds * text_masks
             precision, recall, f1 = get_metrics(preds, bboxes)
-            # print(precision, recall, f1)
 
-            running_precision += precision * bach_size
-            running_recall += recall * bach_size
-            running_f1 += f1 * bach_size
-            dataset_size += bach_size
+            running_precision += precision
+            running_recall += recall
+            running_f1 += f1
+            dataset_size += batch_size
 
     avg_precision = running_precision / dataset_size
     avg_recall = running_recall / dataset_size
     avg_f1 = running_f1 / dataset_size
-    print(
-        f"Precision: {avg_precision:.4f} | Recall: {avg_recall:.4f} | F1: {avg_f1:.4f}"
-    )
+    return avg_precision, avg_recall, avg_f1

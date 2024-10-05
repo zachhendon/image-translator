@@ -7,73 +7,72 @@ from data.dataset import *
 
 train_transform = A.Compose(
     [
-        A.Resize(640, 640),
-        A.HorizontalFlip(),
-        A.VerticalFlip(),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
         A.Affine(
-            scale=(3 / 4, 4 / 3),
             translate_percent=(-0.2, 0.2),
             rotate=(-20, 20),
             shear=(-20, 20),
-            balanced_scale=True,
+            p=1.0,
         ),
-        A.RandomResizedCrop(size=(640, 640), scale=(0.9, 1.0), ratio=(2 / 3, 3 / 2)),
+        A.PadIfNeeded(640, 640, border_mode=cv.BORDER_CONSTANT, value=0, p=1.0),
+        A.RandomCrop(640, 640, p=1.0),
+        A.OneOf(
+            [
+                A.AdvancedBlur(p=1.0),
+                A.Sharpen(p=1.0),
+            ],
+            p=1.0,
+        ),
+        A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=1.0),
         A.GaussNoise(p=1.0),
-        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
-        A.Sharpen(),
-        A.AdvancedBlur(),
-        A.Normalize(),
-        ToTensorV2()
+        A.Normalize(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+            max_pixel_value=255.0,
+            p=1.0,
+        ),
+        ToTensorV2(),
     ],
-    keypoint_params=A.KeypointParams(format="xy"),
+    keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
 )
 
 val_transform = A.Compose(
     [
-        A.Resize(640, 640),
         A.Normalize(),
-        ToTensorV2()
+        ToTensorV2(),
     ],
-    keypoint_params=A.KeypointParams(format="xy"),
 )
 
 
 def collate_fn(batch):
     images = torch.stack([x[0] for x in batch])
+    gt_kernel = torch.stack([x[1][0] for x in batch])
+    gt_text = torch.stack([x[1][1] for x in batch])
+    kernel_masks = torch.stack([x[1][2] for x in batch])
+    text_masks = torch.stack([x[1][3] for x in batch])
+    bboxes = [x[1][4] for x in batch]
 
-    labels = {}
-    # labels["gt_text"] = torch.stack([x[1]["gt_text"] for x in batch])
-    # labels["gt_kernel"] = torch.stack([x[1]["gt_kernel"] for x in batch])
-    labels["maps"] = torch.stack([x[1]["maps"] for x in batch])
-    labels["bboxes"] = [x[1]["bboxes"] for x in batch]
-    return images, labels
+    return images, (gt_kernel, gt_text, kernel_masks, text_masks, bboxes)
 
 
 def get_loaders(datadir, batch_size=16, train=False):
-    dataset = ICDR2015Dataset(datadir)
-    # dataset = SynthtextDataset(datadir)
-    generator = torch.Generator().manual_seed(42)
-    train_dset, val_dset = torch.utils.data.random_split(dataset, [0.8, 0.2], generator)
-    # train_dset, val_dset = torch.utils.data.random_split(dataset, [0.9, 0.1], generator)
+    train_dset = ICDAR2015Dataset2(datadir, train_transform, train=train)
+    val_dset = ICDAR2015Dataset2(datadir, val_transform, train=False)
 
-    if train:
-        train_dset = TransformDataset(train_dset, train_transform)
-    else:
-        train_dset = TransformDataset(train_dset, val_transform)
     train_loader = DataLoader(
         train_dset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train,
         num_workers=4,
         pin_memory=True,
         collate_fn=collate_fn,
     )
 
-    val_dset = TransformDataset(val_dset, val_transform)
     val_loader = DataLoader(
         val_dset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=train,
         num_workers=4,
         pin_memory=True,
         collate_fn=collate_fn,
@@ -83,7 +82,7 @@ def get_loaders(datadir, batch_size=16, train=False):
 
 
 def get_eval_loader(datadir, batch_size=16):
-    dataset = ICDR2015Dataset(datadir)
+    dataset = ICDAR2015Dataset(datadir)
     dataset = TransformDataset(dataset, val_transform)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True
