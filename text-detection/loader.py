@@ -3,10 +3,13 @@ import torch.nn.functional as F
 from nvidia.dali.pipeline import pipeline_def
 import nvidia.dali.types as types
 import nvidia.dali.fn as fn
+from nvidia.dali.fn import python_function
 from nvidia.dali.plugin.pytorch import DALIGenericIterator
 from nvidia.dali.plugin.pytorch.fn import torch_python_function
 import kornia.augmentation as K
 from kornia.utils import draw_convex_polygon
+import numpy as np
+import cv2 as cv
 
 aug = K.AugmentationSequential(
     K.RandomHorizontalFlip(p=0.5),
@@ -24,13 +27,13 @@ aug = K.AugmentationSequential(
     K.RandomGaussianBlur((3, 3), (0.1, 2.0)),
     K.RandomSharpness(0.5),
     # K.RandomGaussianNoise(mean=0, std=0.05, p=1),
-    data_keys=["input", "keypoints", "keypoints", "keypoints", "keypoints"],
+    data_keys=["image", "mask", "mask", "mask", "mask"],
     same_on_batch=False,
 )
 
 resize = K.AugmentationSequential(
     K.SmallestMaxSize(640),
-    data_keys=["input", "keypoints", "keypoints", "keypoints", "keypoints"],
+    data_keys=["image", "mask", "mask", "mask", "mask"],
     same_on_batch=True,
 )
 
@@ -39,110 +42,102 @@ normalize = K.Normalize(
     std=torch.tensor([0.229, 0.224, 0.225]),
 )
 
+call_counter = 0
+CACHE_CLEAR_THRESHOLD = 10
+
 
 def kornia_augment_batch(
     train,
     images,
-    polys_pad,
-    min_polys_pad,
-    num_polys,
-    ignore_polys_pad,
-    min_ignore_polys_pad,
-    num_ignore_polys,
+    kernel_masks,
+    ignore_kernel_masks,
+    text_masks,
+    ignore_text_masks,
 ):
     batch_size = len(images)
-    batch_images = torch.stack(images, dim=0)
-    batch_polys = torch.stack(polys_pad, dim=0).view(batch_size, -1, 2)
-    batch_min_polys = torch.stack(min_polys_pad, dim=0).view(batch_size, -1, 2)
-    batch_ignore_polys = torch.stack(ignore_polys_pad, dim=0).view(batch_size, -1, 2)
-    batch_min_ignore_polys = torch.stack(min_ignore_polys_pad, dim=0).view(
-        batch_size, -1, 2
+    batch_images = torch.cat(images).view(batch_size, *images[0].shape)
+    batch_kernel_masks = torch.cat(kernel_masks).view(
+        batch_size, *kernel_masks[0].shape
     )
-    if train[0]:
-        transformed = aug(
-            batch_images,
-            batch_polys,
-            batch_min_polys,
-            batch_ignore_polys,
-            batch_min_ignore_polys,
-        )
-    else:
-        transformed = resize(
-            batch_images,
-            batch_polys,
-            batch_min_polys,
-            batch_ignore_polys,
-            batch_min_ignore_polys,
-        )
-    images_aug, polys_aug, min_polys_aug, ignore_polys_aug, min_ignore_polys_aug = (
-        transformed
+    batch_ignore_kernel_masks = torch.cat(ignore_kernel_masks).view(
+        batch_size, *ignore_kernel_masks[0].shape
     )
+    batch_text_masks = torch.cat(text_masks).view(batch_size, *text_masks[0].shape)
+    batch_ignore_text_masks = torch.cat(ignore_text_masks).view(
+        batch_size, *ignore_text_masks[0].shape
+    )
+
+    (
+        images_aug,
+        kernel_masks_aug,
+        ignore_kernel_masks_aug,
+        text_masks_aug,
+        ignore_text_masks_aug,
+    ) = (
+        aug(
+            batch_images,
+            batch_kernel_masks.unsqueeze(1),
+            batch_ignore_kernel_masks.unsqueeze(1),
+            batch_text_masks.unsqueeze(1),
+            batch_ignore_text_masks.unsqueeze(1),
+        )
+        if train[0]
+        else resize(
+            batch_images,
+            batch_kernel_masks.unsqueeze(1),
+            batch_ignore_kernel_masks.unsqueeze(1),
+            batch_text_masks.unsqueeze(1),
+            batch_ignore_text_masks.unsqueeze(1),
+        )
+    )
+
     images_normalized = normalize(images_aug)
-
-    polys_aug = polys_aug.view(batch_size, -1, 4, 2)
-    min_polys_aug = min_polys_aug.view(batch_size, -1, 4, 2)
-    ignore_polys_aug = ignore_polys_aug.view(batch_size, -1, 4, 2)
-    min_ignore_polys_aug = min_ignore_polys_aug.view(batch_size, -1, 4, 2)
-
-    polys = []
-    min_polys = []
-    ignore_polys = []
-    min_ignore_polys = []
-    for i in range(len(num_polys)):
-        polys.append(polys_aug[i][: num_polys[i].item()])
-        min_polys.append(min_polys_aug[i][: num_polys[i].item()])
-    for i in range(len(num_ignore_polys)):
-        ignore_polys.append(ignore_polys_aug[i][: num_ignore_polys[i].item()])
-        min_ignore_polys.append(min_ignore_polys_aug[i][: num_ignore_polys[i].item()])
+    kernel_masks_aug = kernel_masks_aug.squeeze(1)
+    ignore_kernel_masks_aug = ignore_kernel_masks_aug.squeeze(1)
+    text_masks_aug = text_masks_aug.squeeze(1)
+    ignore_text_masks_aug = ignore_text_masks_aug.squeeze(1)
 
     return (
-        list(images_normalized.unbind(dim=0)),
-        polys,
-        min_polys,
-        ignore_polys,
-        min_ignore_polys,
+        list(images_normalized),
+        list(kernel_masks_aug),
+        list(ignore_kernel_masks_aug),
+        list(text_masks_aug),
+        list(ignore_text_masks_aug),
     )
 
 
 def get_masks(images, polys, min_polys):
     h, w = images[0].shape[1:]
-    batch_polys = torch.vstack(polys)
-    batch_min_polys = torch.vstack(min_polys)
+    batch_polys = np.vstack(polys)
+    batch_min_polys = np.vstack(min_polys)
     if batch_polys.shape[0] == 0:
         return (
-            list(torch.zeros((len(polys), 1, h, w), device="cuda").unbind(dim=0)),
-            list(torch.zeros((len(polys), 1, h, w), device="cuda").unbind(dim=0)),
+            list(np.zeros((len(polys), h, w))),
+            list(np.zeros((len(polys), h, w))),
         )
 
-    text_components = torch.zeros(
-        batch_polys.shape[0],
-        1,
-        h,
-        w,
-        dtype=torch.float32,
-        device="cuda",
+    text_components = np.zeros(
+        (batch_polys.shape[0], 1, h, w),
+        dtype=np.float32,
     )
-    text_components = draw_convex_polygon(
-        text_components, batch_polys, torch.tensor([1], device="cuda")
-    )
+    cv.fillPoly(text_components, [poly.astype(np.int32) for poly in batch_polys], 1)
 
-    kernel_components = -F.max_pool2d(
-        -text_components,
-        kernel_size=9,
-        stride=1,
-        padding=4,
+    kernel_components = (
+        -F.max_pool2d(
+            -torch.from_numpy(text_components).to(dtype=torch.float32, device="cuda"),
+            kernel_size=9,
+            stride=1,
+            padding=4,
+        )
+        .cpu()
+        .numpy()
     )
-    min_components = torch.zeros(
-        batch_polys.shape[0],
-        1,
-        h,
-        w,
-        dtype=torch.float32,
-        device="cuda",
-    )
-    min_components = draw_convex_polygon(
-        min_components, batch_min_polys, torch.tensor([1], device="cuda")
-    )
+    min_components = np.zeros((batch_polys.shape[0], 1, h, w), dtype=np.float32)
+    cv.fillPoly(min_components, [poly.astype(np.int32) for poly in batch_min_polys], 1)
+
+    text_components = text_components.squeeze(1)
+    kernel_components = kernel_components.squeeze(1)
+    min_components = min_components.squeeze(1)
 
     text_masks = []
     kernel_masks = []
@@ -150,16 +145,20 @@ def get_masks(images, polys, min_polys):
     for i in range(len(polys)):
         r = l + polys[i].shape[0]
         if l == r:
-            text_masks.append(torch.zeros((1, h, w), device="cuda"))
-            kernel_masks.append(torch.zeros((1, h, w), device="cuda"))
+            text_masks.append(np.zeros((h, w), dtype=np.float32))
+            kernel_masks.append(np.zeros((h, w), dtype=np.float32))
         else:
-            text_masks.append(torch.clamp(text_components[l:r].sum(axis=0), 0, 1))
+            text_masks.append(np.clip(text_components[l:r].sum(axis=0), 0, 1))
             kernel_masks.append(
-                torch.clamp(
+                np.clip(
                     (kernel_components[l:r] + min_components[l:r]).sum(axis=0), 0, 1
                 )
             )
-        l = r
+            l = r
+
+    text_masks = list(text_masks)
+    kernel_masks = list(kernel_masks)
+
     return text_masks, kernel_masks
 
 
@@ -200,9 +199,9 @@ def pad_keypoints(polys, ignore_polys):
 
 def stack_polys(polys):
     if not polys:
-        return torch.zeros((0, 4, 2), device="cuda")
+        return np.zeros((0, 4, 2), dtype=np.float32)
     else:
-        return torch.stack(polys)
+        return np.stack(polys)
 
 
 def get_polygons(categories, poly_groups, keypoints):
@@ -238,15 +237,13 @@ def my_pipeline(datadir, train):
         file_root=f"{datadir}/images",
         annotations_file=f"{datadir}/annotations.json",
         polygon_masks=True,
-        shuffle_after_epoch=train
+        shuffle_after_epoch=True,
     )
-    images = fn.decoders.image(jpegs, device="cpu", output_type=types.BGR).gpu()
+    images = fn.decoders.image(jpegs, device="cpu", output_type=types.BGR)
     images = fn.transpose(images, perm=[2, 0, 1]) / 255
 
-    categories = categories.gpu()
-    poly_groups = poly_groups.gpu()
-    keypoints = keypoints.gpu()
-    polys, min_polys, ignore_polys, min_ignore_polys = torch_python_function(
+    # get polygons from keypoints
+    polys, min_polys, ignore_polys, min_ignore_polys = python_function(
         categories,
         poly_groups,
         keypoints,
@@ -255,36 +252,8 @@ def my_pipeline(datadir, train):
         batch_processing=False,
     )
 
-    polys_pad, num_polys, ignore_polys_pad, num_ignore_polys = torch_python_function(
-        polys,
-        ignore_polys,
-        function=pad_keypoints,
-        num_outputs=4,
-        batch_processing=True,
-    )
-    min_polys_pad, _, min_ignore_polys_pad, _ = torch_python_function(
-        min_polys,
-        min_ignore_polys,
-        function=pad_keypoints,
-        num_outputs=4,
-        batch_processing=True,
-    )
-
-    images, polys, min_polys, ignore_polys, min_ignore_polys = torch_python_function(
-        train,
-        images,
-        polys_pad,
-        min_polys_pad,
-        num_polys,
-        ignore_polys_pad,
-        min_ignore_polys_pad,
-        num_ignore_polys,
-        function=kornia_augment_batch,
-        num_outputs=5,
-        batch_processing=True,
-    )
-
-    text_masks, kernel_masks = torch_python_function(
+    # convert polygons to masks
+    text_masks, kernel_masks = python_function(
         images,
         polys,
         min_polys,
@@ -292,7 +261,7 @@ def my_pipeline(datadir, train):
         num_outputs=2,
         batch_processing=True,
     )
-    ignore_text_masks, ignore_kernel_masks = torch_python_function(
+    ignore_text_masks, ignore_kernel_masks = python_function(
         images,
         ignore_polys,
         min_ignore_polys,
@@ -301,56 +270,54 @@ def my_pipeline(datadir, train):
         batch_processing=True,
     )
 
-    if train:
-        return (
+    images = images.gpu()
+    kernel_masks = kernel_masks.gpu()
+    ignore_kernel_masks = ignore_kernel_masks.gpu()
+    text_masks = text_masks.gpu()
+    ignore_text_masks = ignore_text_masks.gpu()
+
+    images, kernel_masks, ignore_kernel_masks, text_masks, ignore_text_masks = (
+        torch_python_function(
+            train,
             images,
-            text_masks,
             kernel_masks,
-            ignore_text_masks,
             ignore_kernel_masks,
-        )
-    else:
-        polys, num_polys, ignore_polys, num_ignore_polys = torch_python_function(
-            polys,
-            ignore_polys,
-            function=pad_keypoints,
-            num_outputs=4,
+            text_masks,
+            ignore_text_masks,
+            function=kornia_augment_batch,
+            num_outputs=5,
             batch_processing=True,
         )
-
-        return (
-            images,
-            polys_pad,
-            num_polys,
-            ignore_polys_pad,
-            num_ignore_polys,
-            text_masks,
-            kernel_masks,
-            ignore_text_masks,
-            ignore_kernel_masks,
-        )
+    )
+    return (
+        images,
+        kernel_masks,
+        ignore_kernel_masks,
+        text_masks,
+        ignore_text_masks,
+    )
 
 
-def get_loader(batch_size, dset):
-    train_dir = f"data/processed/{dset}/train"
-    val_dir = f"data/processed/{dset}/val"
+def get_loader(batch_size, datadir):
+    train_dir = f"{datadir}/train"
+    val_dir = f"{datadir}/val"
     train_loader = DALIGenericIterator(
         [
             my_pipeline(
                 train_dir,
                 train=True,
                 batch_size=batch_size,
-                num_threads=1,
+                num_threads=2,
                 device_id=0,
                 prefetch_queue_depth=2,
             )
         ],
         [
             "images",
-            "text_masks",
             "kernel_masks",
-            "ignore_text_masks",
             "ignore_kernel_masks",
+            "text_masks",
+            "ignore_text_masks",
         ],
     )
     val_loader = DALIGenericIterator(
@@ -359,21 +326,21 @@ def get_loader(batch_size, dset):
                 val_dir,
                 train=False,
                 batch_size=batch_size,
-                num_threads=1,
+                num_threads=2,
                 device_id=0,
                 prefetch_queue_depth=2,
             )
         ],
         [
             "images",
-            "polys",
-            "num_polys",
-            "ignore_polys",
-            "num_ignore_polys",
-            "text_masks",
             "kernel_masks",
-            "ignore_text_masks",
             "ignore_kernel_masks",
+            "text_masks",
+            "ignore_text_masks",
+            # "polys",
+            # "num_polys",
+            # "ignore_polys",
+            # "num_ignore_polys",
         ],
     )
     return train_loader, val_loader
