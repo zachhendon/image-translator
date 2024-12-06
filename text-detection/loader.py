@@ -93,7 +93,6 @@ class ICDAR2015Dataset(Dataset):
             r = l + len(bboxes[i])
             if l == r:
                 batch_kernel_masks.append(torch.zeros(size, device="cuda"))
-                batch_kernel_masks.append(torch.zeros(size, device="cuda"))
                 batch_text_masks.append(torch.zeros(size, device="cuda"))
             else:
                 batch_kernel_masks.append(
