@@ -9,13 +9,6 @@ def get_ohem_masks(pred, gt, masks, ratio=3.0):
         )
         num_neg = int(min(torch.sum(gt[i] <= 0.5), num_pos * ratio))
         if num_pos == 0 or num_neg == 0:
-            # num_total = masks[i].numel()
-            # num_zero = int(num_total * 0.5)
-            # zero_indices = torch.randperm(num_total)[:num_zero]
-            # mask = masks[i].view(-1)
-            # mask[zero_indices] = 0
-            # mask = mask.view(masks[i].size())
-            # ohem_masks.append(mask)
             ohem_masks.append(masks[i])
             continue
 

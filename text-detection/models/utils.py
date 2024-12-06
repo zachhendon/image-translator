@@ -68,7 +68,7 @@ def get_components(img):
     labels = torch.from_numpy(labels).to(dtype=torch.float32)
 
     for i in range(1, int(labels.max()) + 1):
-        if (labels == i).sum() <= 10:
+        if (labels == i).sum() <= 20:
             labels[labels == i] = 0
 
     labels = labels.cuda()
@@ -138,14 +138,15 @@ def blur_image(image):
 
 
 def get_metrics(pred, bboxes):
-    threshold = 0.7
+    # threshold = 0.75 # dice
+    threshold = 0.55  # ufl_asym
 
     total_precision = 0.0
     total_recall = 0.0
-    total_f1 = 0.0
     for i in range(len(pred)):
         binary = (pred[i] > threshold).to(dtype=torch.float32)
-        binary = (blur_image(binary) > 0.1).astype(np.uint8)
+        # binary = (blur_image(binary) > 0.2).astype(np.uint8)
+        binary = binary.cpu().numpy().astype(np.uint8)
         pred_labels = get_components(binary)
         gt_labels = get_gt_labels(bboxes[i], pred_labels.shape)
 
@@ -158,6 +159,7 @@ def get_metrics(pred, bboxes):
         true_positives = len(matches)
         false_positives = len(pred_ids) - true_positives
         false_negatives = len(gt_ids) - true_positives
+        # return true_positives, false_positives, false_negatives
 
         if len(gt_ids) == 0:
             precision = 1 if len(pred_ids) == 0 else 0
@@ -165,55 +167,158 @@ def get_metrics(pred, bboxes):
             f1 = precision
         else:
             precision = (
-                0
-                if true_positives == 0
+                1
+                if true_positives + false_positives == 0
                 else true_positives / (true_positives + false_positives)
             )
             recall = (
-                0
-                if true_positives == 0
+                1
+                if true_positives + false_negatives == 0
                 else true_positives / (true_positives + false_negatives)
-            )
-            f1 = (
-                0
-                if precision + recall == 0
-                else (2 * precision * recall) / (precision + recall)
             )
 
         total_precision += precision
         total_recall += recall
-        total_f1 += f1
 
-    return (total_precision, total_recall, total_f1)
+    return (total_precision, total_recall)
 
 
-def evaluate(model, loader):
+def get_metrics_micro(pred, bboxes):
+    # threshold = 0.75 # dice
+    threshold = 0.55  # ufl_asym
+
+    for i in range(len(pred)):
+        binary = (pred[i] > threshold).to(dtype=torch.float32)
+        # binary = (blur_image(binary) > 0.2).astype(np.uint8)
+        binary = binary.cpu().numpy().astype(np.uint8)
+        pred_labels = get_components(binary)
+        gt_labels = get_gt_labels(bboxes[i], pred_labels.shape)
+
+        pred_ids = np.unique(pred_labels.cpu())[1:].tolist()
+        gt_ids = np.unique(gt_labels.cpu())[1:].tolist()
+
+        iou_matrix = get_iou_matrix(pred_labels, gt_labels, pred_ids, gt_ids)
+        matches = match_bboxes(iou_matrix, pred_ids, gt_ids)
+
+        true_positives = len(matches)
+        false_positives = len(pred_ids) - true_positives
+        false_negatives = len(gt_ids) - true_positives
+        return true_positives, false_positives, false_negatives
+
+
+def get_metrics_v2(pred, bboxes, ignore_bboxes):
+    threshold = 0.55
+
+    total_precision = 0
+    total_recall = 0
+    for i in range(len(pred)):
+        binary = (pred[i] > threshold).to(dtype=torch.float32)
+        binary = binary.cpu().numpy().astype(np.uint8)
+
+        pred_labels = get_components(binary)
+        gt_labels = get_gt_labels(bboxes[i], pred_labels.shape)
+        gt_labels_ignore = get_gt_labels(ignore_bboxes[i], pred_labels.shape)
+
+        pred_ids = np.unique(pred_labels.cpu())[1:].tolist()
+        gt_ids = np.unique(gt_labels.cpu())[1:].tolist()
+        gt_ids_ignore = np.unique(gt_labels_ignore.cpu())[1:].tolist()
+
+        iou_matrix = get_iou_matrix(pred_labels, gt_labels, pred_ids, gt_ids)
+        iou_matrix_ignore = get_iou_matrix(
+            pred_labels, gt_labels_ignore, pred_ids, gt_ids_ignore
+        )
+        matches = match_bboxes(iou_matrix, pred_ids, gt_ids)
+        matches_ignore = match_bboxes(iou_matrix_ignore, pred_ids, gt_ids_ignore)
+
+        true_positives = len(matches)
+        false_positives = len(pred_ids) - len(matches) - len(matches_ignore)
+        false_negatives = len(gt_ids) - len(matches)
+
+        if len(gt_ids) == 0:
+            precision = 0 if len(pred_ids) > 0 else 1
+            recall = 1
+        else:
+            precision = (
+                1
+                if true_positives + false_positives == 0
+                else true_positives / (true_positives + false_positives)
+            )
+            recall = (
+                1
+                if true_positives + false_negatives == 0
+                else true_positives / (true_positives + false_negatives)
+            )
+
+        total_precision += precision
+        total_recall += recall
+    return total_precision, total_recall
+
+
+def evaluate(model, iter, limit=float("inf"), dtype=torch.float32):
     running_precision = 0.0
     running_recall = 0.0
-    running_f1 = 0.0
     dataset_size = 0
 
     model.eval()
 
     with torch.no_grad():
-        for images, (_, _, kernel_masks, text_masks, bboxes) in loader:
-            images = images.to(dtype=torch.float32, device="cuda")
-            kernel_masks = kernel_masks.to(dtype=torch.float32, device="cuda")
-            text_masks = text_masks.to(dtype=torch.float32, device="cuda")
+        i = 0
+        while i < limit:
+            try:
+                images, (_, _, kernel_masks, text_masks, bboxes, _) = next(iter)
+            except StopIteration:
+                break
+            images = images.to(dtype=dtype, device="cuda")
+            kernel_masks = kernel_masks.to(dtype=dtype, device="cuda")
+            text_masks = text_masks.to(dtype=dtype, device="cuda")
 
             batch_size = len(images)
 
             preds = model(images)
-            # preds = preds * kernel_masks
             preds = preds * text_masks
-            precision, recall, f1 = get_metrics(preds, bboxes)
+            precision, recall = get_metrics(preds, bboxes)
+            # precision, recall = get_metrics_v2(preds, bboxes, ignore_bboxes)
 
             running_precision += precision
             running_recall += recall
-            running_f1 += f1
             dataset_size += batch_size
+            i += 1
 
     avg_precision = running_precision / dataset_size
     avg_recall = running_recall / dataset_size
-    avg_f1 = running_f1 / dataset_size
+    avg_f1 = 2 * avg_precision * avg_recall / (avg_precision + avg_recall)
     return avg_precision, avg_recall, avg_f1
+
+
+def evaluate_micro(model, iter, limit=float("inf"), dtype=torch.float32):
+    num_tp = 0
+    num_fp = 0
+    num_fn = 0
+
+    model.eval()
+
+    with torch.no_grad():
+        i = 0
+        while i < limit:
+            try:
+                images, (_, _, kernel_masks, text_masks, bboxes, _) = next(iter)
+            except StopIteration:
+                break
+            images = images.to(dtype=dtype, device="cuda")
+            kernel_masks = kernel_masks.to(dtype=dtype, device="cuda")
+            text_masks = text_masks.to(dtype=dtype, device="cuda")
+
+            preds = model(images)
+            preds = preds * text_masks
+            true_positives, false_positives, false_negatives = get_metrics_micro(
+                preds, bboxes
+            )
+            num_tp += true_positives
+            num_fp += false_positives
+            num_fn += false_negatives
+
+            i += 1
+    precision = num_tp / (num_tp + num_fp)
+    recall = num_tp / (num_tp + num_fn)
+    f1 = 2 * precision * recall / (precision + recall)
+    return precision, recall, f1

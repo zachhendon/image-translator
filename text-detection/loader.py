@@ -5,6 +5,7 @@ from torchvision.io import read_file, decode_jpeg
 import kornia.augmentation as K
 from kornia.utils import draw_convex_polygon
 from glob import glob
+import math
 
 
 class ICDAR2015Dataset(Dataset):
@@ -17,32 +18,31 @@ class ICDAR2015Dataset(Dataset):
             mean=torch.tensor([0.485, 0.456, 0.406]),
             std=torch.tensor([0.229, 0.224, 0.225]),
         )
-        if train:
-            self.aug = K.AugmentationSequential(
-                K.RandomHorizontalFlip(p=0.5),
-                K.RandomVerticalFlip(p=0.5),
-                K.RandomAffine(
-                    degrees=(-20, 20),
-                    translate=(0.2, 0.2),
-                    shear=(-20, 20),
-                    scale=(0.8, 1.2),
-                    p=1.0,
-                ),
-                K.RandomPerspective(distortion_scale=0.3, p=0.3),
-                K.RandomCrop((640, 640)),
-                K.ColorJitter(0.1, 0.1, 0.1, 0.1),
-                K.RandomGaussianBlur((3, 3), (0.1, 2.0)),
-                K.RandomSharpness(0.5),
-                K.RandomGaussianNoise(mean=0, std=0.05, p=1),
-                data_keys=["image", "keypoints", "keypoints", "keypoints", "keypoints"],
-                same_on_batch=False,
-            )
-        else:
-            self.aug = K.AugmentationSequential(
-                K.SmallestMaxSize(640),
-                data_keys=["image", "keypoints", "keypoints", "keypoints", "keypoints"],
-                same_on_batch=True,
-            )
+        self.aug = K.AugmentationSequential(
+            K.RandomHorizontalFlip(p=0.5),
+            K.RandomVerticalFlip(p=0.5),
+            # K.RandomAffine(
+            #     degrees=(-20, 20),
+            #     translate=(0.2, 0.2),
+            #     shear=(-20, 20),
+            #     scale=(0.8, 1.2),
+            #     p=1.0,
+            # ),
+            # K.RandomPerspective(distortion_scale=0.3, p=0.3),
+            K.RandomCrop((640, 640)),
+            # K.ColorJitter(0.1, 0.1, 0.1, 0.1),
+            # K.RandomGaussianBlur((3, 3), (0.1, 2.0)),
+            # K.RandomSharpness(0.5),
+            # K.RandomGaussianNoise(mean=0, std=0.05, p=1),
+            data_keys=["image", "keypoints", "keypoints", "keypoints", "keypoints"],
+            same_on_batch=False,
+        )
+        # else:
+        #     self.aug = K.AugmentationSequential(
+        #         K.SmallestMaxSize(640),
+        #         data_keys=["image", "keypoints", "keypoints", "keypoints", "keypoints"],
+        #         same_on_batch=True,
+        #     )
 
     def __len__(self):
         return self.num_images
@@ -136,9 +136,19 @@ class ICDAR2015Dataset(Dataset):
 
         # apply augmentations
         images = self.normalize(images)
-        images, bboxes, ignore_bboxes, min_bboxes, min_ignore_bboxes = self.aug(
-            images, bboxes, ignore_bboxes, min_bboxes, min_ignore_bboxes
-        )
+        if self.train:
+            images, bboxes, ignore_bboxes, min_bboxes, min_ignore_bboxes = self.aug(
+                images, bboxes, ignore_bboxes, min_bboxes, min_ignore_bboxes
+            )
+        else:
+            h, w = images.shape[2:]
+            long_size = math.ceil((w * 640 / h) / 4) * 4
+            resize = K.AugmentationSequential(
+                K.Resize((640, long_size)),
+                data_keys=["image", "keypoints", "keypoints", "keypoints", "keypoints"],
+                same_on_batch=True,
+            )
+            images, bboxes, ignore_bboxes, min_bboxes, min_ignore_bboxes = resize(images, bboxes, ignore_bboxes, min_bboxes, min_ignore_bboxes)
 
         # process augmented bboxes
         bboxes = [
@@ -164,6 +174,8 @@ class ICDAR2015Dataset(Dataset):
         ignore_kernel_masks, ignore_text_masks = self.get_masks(
             ignore_bboxes, min_ignore_bboxes, size
         )
+        ignore_kernel_masks = [1 - mask for mask in ignore_kernel_masks]
+        ignore_text_masks = [1 - mask for mask in ignore_text_masks]
 
         return (
             list(images),

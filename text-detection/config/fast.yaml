@@ -1,0 +1,19 @@
+model:
+    type: fast
+    kernel_loss: balanced_bce_loss
+    text_loss: dice_loss
+data:
+    batch_size: 16
+    datadir: ./data/processed/icdar2015_coco
+train:
+    lr: 1e-3
+    min_lr: 1e-5
+    num_iterations: 15000
+    train_eval_interval: 100
+    val_eval_interval: 25
+    optimizer: adamw
+    schedule: cosine_warmup
+    warmup_iterations: 1000
+    save_interval: 10
+    checkpoint: null
+    resume: null
