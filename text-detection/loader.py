@@ -35,10 +35,10 @@ class FastDataset(Dataset):
             ),
             K.RandomPerspective(distortion_scale=0.3, p=0.3),
             K.RandomCrop((640, 640)),
-            # K.ColorJitter(0.1, 0.1, 0.1, 0.1),
+            K.ColorJitter(0.1, 0.1, 0.1, 0.1),
             K.RandomGaussianBlur((3, 3), (0.1, 2.0)),
             K.RandomSharpness(0.5),
-            # K.RandomGaussianNoise(mean=0, std=1.00, p=1),
+            K.RandomGaussianNoise(mean=0, std=0.05, p=1),
             data_keys=self.data_keys,
             same_on_batch=False,
         )
@@ -118,12 +118,15 @@ class FastDataset(Dataset):
             min_bboxes_aug = []
 
             for image, bbox, min_bbox in zip(images, bboxes, min_bboxes):
+                if len(bbox.shape) == 2:
+                    bbox = bbox.unsqueeze(0)
+                    min_bbox = min_bbox.unsqueeze(0)
                 image, bbox, min_bbox = aug(
-                    image.unsqueeze(0), bbox.unsqueeze(0), min_bbox.unsqueeze(0)
+                    image, bbox, min_bbox
                 )
-                images_aug.append(image.squeeze(0))
-                bboxes_aug.append(bbox.squeeze(0))
-                min_bboxes_aug.append(min_bbox.squeeze(0))
+                images_aug.append(image)
+                bboxes_aug.append(bbox)
+                min_bboxes_aug.append(min_bbox)
         else:
             images_aug, bboxes_aug, min_bboxes_aug = aug(images, bboxes, min_bboxes)
         return images_aug, bboxes_aug, min_bboxes_aug
@@ -142,17 +145,17 @@ class FastDataset(Dataset):
                 images, bboxes, min_bboxes, ignore_bboxes, min_ignore_bboxes
             ):
                 image, bbox, min_bbox, ignore_bbox, min_ignore_bbox = aug(
-                    image.unsqueeze(0),
-                    bbox.unsqueeze(0),
-                    min_bbox.unsqueeze(0),
-                    ignore_bbox.unsqueeze(0),
-                    min_ignore_bbox.unsqueeze(0),
+                    image,
+                    bbox,
+                    min_bbox,
+                    ignore_bbox,
+                    min_ignore_bbox,
                 )
-                images_aug.append(image.squeeze(0))
-                bboxes_aug.append(bbox.squeeze(0))
-                min_bboxes_aug.append(min_bbox.squeeze(0))
-                ignore_bboxes_aug.append(ignore_bbox.squeeze(0))
-                min_ignore_bboxes_aug.append(min_ignore_bbox.squeeze(0))
+                images_aug.append(image)
+                bboxes_aug.append(bbox)
+                min_bboxes_aug.append(min_bbox)
+                ignore_bboxes_aug.append(ignore_bbox)
+                min_ignore_bboxes_aug.append(min_ignore_bbox)
         else:
             (
                 images_aug,
@@ -210,7 +213,7 @@ class FastDataset(Dataset):
             images = torch.stack(images) / 255
             images = self.normalize(images)
         else:
-            images = [self.normalize(img / 255).squeeze(0) for img in images]
+            images = [self.normalize(img / 255) for img in images]
             bboxes = list(bboxes)
             min_bboxes = list(min_bboxes)
             if self.ignore:
@@ -248,11 +251,11 @@ class FastDataset(Dataset):
                     )
                 )
                 if type(images) == list:
-                    images = torch.stack(images)
-                    bboxes = torch.stack(bboxes)
-                    min_bboxes = torch.stack(min_bboxes)
-                    ignore_bboxes = torch.stack(ignore_bboxes)
-                    min_ignore_bboxes = torch.stack(min_ignore_bboxes)
+                    images = torch.cat(images)
+                    bboxes = torch.cat(bboxes)
+                    min_bboxes = torch.cat(min_bboxes)
+                    ignore_bboxes = torch.cat(ignore_bboxes)
+                    min_ignore_bboxes = torch.cat(min_ignore_bboxes)
             else:
                 images, bboxes, min_bboxes = self.apply_augmentations(
                     images,
@@ -261,11 +264,16 @@ class FastDataset(Dataset):
                     self.aug,
                 )
                 if type(images) == list:
-                    images = torch.stack(images)
-                    bboxes = torch.stack(bboxes)
-                    min_bboxes = torch.stack(min_bboxes)
+                    images = torch.cat(images)
+                    bboxes = torch.cat(bboxes)
+                    min_bboxes = torch.cat(min_bboxes)
         else:
-            h, w = images[0].shape[1:]
+            if type(images) == list:
+                h = sum([img.shape[2] for img in images]) // len(images)
+                w = sum([img.shape[3] for img in images]) // len(images)
+            else:
+                h, w = images[0].shape[2:]
+            
             long_size = math.ceil((w * 640 / h) / 4) * 4
             resize = K.AugmentationSequential(
                 K.Resize((640, long_size)),
@@ -284,11 +292,11 @@ class FastDataset(Dataset):
                     )
                 )
                 if type(images) == list:
-                    images = torch.stack(images)
-                    bboxes = torch.stack(bboxes)
-                    min_bboxes = torch.stack(min_bboxes)
-                    ignore_bboxes = torch.stack(ignore_bboxes)
-                    min_ignore_bboxes = torch.stack(min_ignore_bboxes)
+                    images = torch.cat(images)
+                    bboxes = torch.cat(bboxes)
+                    min_bboxes = torch.cat(min_bboxes)
+                    ignore_bboxes = torch.cat(ignore_bboxes)
+                    min_ignore_bboxes = torch.cat(min_ignore_bboxes)
             else:
                 images, bboxes, min_bboxes = self.apply_augmentations(
                     images,
@@ -297,10 +305,9 @@ class FastDataset(Dataset):
                     resize,
                 )
                 if type(images) == list:
-                    images = torch.stack(images)
-                    bboxes = torch.stack(bboxes)
-                    min_bboxes = torch.stack(min_bboxes)
-
+                    images = torch.cat(images)
+                    bboxes = torch.cat(bboxes)
+                    min_bboxes = torch.cat(min_bboxes)
         # process augmented bboxes
         bboxes = [
             bb[: num_bboxes[i]]
@@ -366,9 +373,11 @@ class DataLoaderIterator:
             return next(self.iter)
 
 
-def get_icdar2015_loaders(root_dir, batch_size=16):
-    train_dataset = FastDataset(f"{root_dir}/icdar2015/train", train=True, ignore=True)
-    val_dataset = FastDataset(f"{root_dir}/icdar2015/val", train=False, ignore=True)
+def get_icdar2015_loaders(batch_size=16):
+    train_dataset = FastDataset(
+        "data/processed/icdar2015/train", train=True, ignore=True
+    )
+    val_dataset = FastDataset("data/processed/icdar2015/val", train=False, ignore=True)
     return (
         DataLoaderIterator(
             train_dataset,
@@ -383,9 +392,11 @@ def get_icdar2015_loaders(root_dir, batch_size=16):
     )
 
 
-def get_synthtext_loaders(root_dir, batch_size=16):
-    train_dataset = FastDataset(f"{root_dir}/synthtext/train", train=True, ignore=False)
-    val_dataset = FastDataset(f"{root_dir}/synthtext/val", train=False, ignore=False)
+def get_synthtext_loaders(batch_size=16):
+    train_dataset = FastDataset(
+        "data/processed/synthtext/train", train=True, ignore=False
+    )
+    val_dataset = FastDataset("data/processed/synthtext/val", train=False, ignore=False)
     return (
         DataLoaderIterator(
             train_dataset,

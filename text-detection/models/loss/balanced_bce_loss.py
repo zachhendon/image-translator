@@ -11,10 +11,10 @@ class BalancedBCELoss(nn.Module):
         ratio = 3.0
         pos = gt * masks
         neg = (1 - gt) * masks
-        num_pos = int((gt * masks).sum())
-        num_neg = int(min((1 - gt).sum(), num_pos * ratio))
+        num_pos = int(pos.sum())
+        num_neg = int(min(neg.sum(), num_pos * ratio))
 
-        loss = F.binary_cross_entropy(pred, gt, reduction="none")
+        loss = F.binary_cross_entropy(pred, gt, reduction="none") * masks
         positive_loss = loss * pos
         negative_loss = loss * neg
         negative_loss, _ = torch.topk(negative_loss.view(-1), num_neg)

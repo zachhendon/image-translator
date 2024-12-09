@@ -4,10 +4,10 @@ from torch.utils.tensorboard import SummaryWriter
 import argparse
 import os
 import os.path as osp
-import glob
+from glob import glob
 from models.utils import evaluate, evaluate_micro
 from hydra import compose, initialize
-from loader import get_icdar2015_loaders
+from loader import *
 from models.fast import FAST
 from models.loss.ohem import get_ohem_masks
 from models.loss.balanced_bce_loss import BalancedBCELoss
@@ -18,7 +18,7 @@ import time
 
 
 def get_run_id(cfg):
-    prev_runs = glob.glob(f"checkpoints/{cfg}*")
+    prev_runs = glob(f"checkpoints/{cfg}*")
     if len(prev_runs) == 0:
         prev_run_id = -1
     else:
@@ -28,13 +28,15 @@ def get_run_id(cfg):
 
 
 def calculate_total_loss(kernel_loss, text_loss):
-    return 3 * kernel_loss + text_loss
+    return kernel_loss + 0.5 * text_loss
 
 
 def main(cfg, args):
     batch_size = cfg.data.batch_size
-    # train_loader, val_loader = get_loader(batch_size, cfg.data.datadir)
-    train_loader, val_loader = get_icdar2015_loaders("data/processed", batch_size)
+    if cfg.data.dataset == "icdar2015":
+        train_loader, val_loader = get_icdar2015_loaders(batch_size=batch_size)
+    elif cfg.data.dataset == "synthtext":
+        train_loader, val_loader = get_synthtext_loaders(batch_size=batch_size)
 
     num_iterations = cfg.train.num_iterations
     if cfg.train.train_eval_interval:
@@ -62,6 +64,10 @@ def main(cfg, args):
     # optimizer
     if cfg.train.optimizer == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr)
+    elif cfg.train.optimizer == "sgd":
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=cfg.train.lr, momentum=0.9, weight_decay=1e-4
+        )
 
     if cfg.train.schedule == "cosine_warmup":
         scheduler = PretrainingScheduler(
@@ -111,7 +117,7 @@ def main(cfg, args):
         train_text_running_loss = 0.0
         train_running_loss = 0.0
 
-        for _ in range(train_eval_interval):
+        for i in range(train_eval_interval):
             images, kernel_masks, ignore_kernel_masks, text_masks, ignore_text_masks = (
                 next(train_loader)
             )
@@ -148,9 +154,13 @@ def main(cfg, args):
 
         with torch.no_grad():
             for _ in range(val_eval_interval):
-                images, kernel_masks, ignore_kernel_masks, text_masks, ignore_text_masks = (
-                    next(val_loader)
-                )
+                (
+                    images,
+                    kernel_masks,
+                    ignore_kernel_masks,
+                    text_masks,
+                    ignore_text_masks,
+                ) = next(val_loader)
 
                 preds = model(images)
                 dilated_preds = torch.nn.functional.max_pool2d(

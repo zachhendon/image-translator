@@ -47,6 +47,9 @@ def get_min_bboxes(bboxes):
         poly = Polygon(bbox)
         offset = poly.area * (1 - rate) / poly.length
         shrunk_poly = poly.buffer(-offset)
+        if shrunk_poly.is_empty:
+            shrunk_bboxes.append(bbox)
+            continue
         shrunk_bboxes.append(list(shrunk_poly.exterior.coords)[:4])
     return np.array(shrunk_bboxes).reshape(-1, 4, 2).astype(np.float32)
 
@@ -115,13 +118,9 @@ def process_synthtext_data(image_paths, bboxes, subdir):
     images_dir = f"{subdir}/images"
     bboxes_dir = f"{subdir}/bboxes"
     min_bboxes_dir = f"{subdir}/min_bboxes"
-    ignore_bboxes_dir = f"{subdir}/ignore_bboxes"
-    min_ignore_bboxes_dir = f"{subdir}/min_ignore_bboxes"
     os.makedirs(images_dir, exist_ok=True)
     os.makedirs(bboxes_dir, exist_ok=True)
     os.makedirs(min_bboxes_dir, exist_ok=True)
-    os.makedirs(ignore_bboxes_dir, exist_ok=True)
-    os.makedirs(min_ignore_bboxes_dir, exist_ok=True)
 
     for i, (image_path, bbox) in enumerate(tqdm(zip(image_paths, bboxes))):
         id = str(i).zfill(6)
@@ -131,10 +130,6 @@ def process_synthtext_data(image_paths, bboxes, subdir):
         min_bbox = get_min_bboxes(bbox)
         torch.save(torch.from_numpy(bbox).float(), f"{bboxes_dir}/{id}.pt")
         torch.save(torch.from_numpy(min_bbox).float(), f"{min_bboxes_dir}/{id}.pt")
-
-        torch.save(torch.tensor([]).reshape(0, 4, 2), f"{ignore_bboxes_dir}/{id}.pt")
-        torch.save(torch.tensor([]).reshape(0, 4, 2), f"{min_ignore_bboxes_dir}/{id}.pt")
-
 
 def process_synthtext(save_dir):
     data = loadmat("data/raw/synthtext/gt.mat")
@@ -155,7 +150,7 @@ def process_synthtext(save_dir):
     train_subdir = f"{save_dir}/train"
     val_subdir = f"{save_dir}/val"
 
-    # process_synthtext_data(train_img_paths, train_bboxes, train_subdir)
+    process_synthtext_data(train_img_paths, train_bboxes, train_subdir)
     process_synthtext_data(val_img_paths, val_bboxes, val_subdir)
 
 
