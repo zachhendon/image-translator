@@ -160,6 +160,8 @@ def main(cfg, args):
                     ignore_kernel_masks,
                     text_masks,
                     ignore_text_masks,
+                    _,
+                    _,
                 ) = next(val_loader)
 
                 preds = model(images)
@@ -182,7 +184,7 @@ def main(cfg, args):
 
         # log to tensorboard
         print(
-            f"[Iter {iteration}] | train loss: {train_loss:.4f} | val loss: {val_loss:.4f} | lr: {scheduler.get_last_lr()[0]:.7f}"
+            f"[Iter {iteration}] | train loss: {train_loss:.5f} | val loss: {val_loss:.5f} | lr: {scheduler.get_last_lr()[0]:.7f}"
         )
         writer.add_scalars(
             "kernel_loss",
@@ -211,10 +213,25 @@ def main(cfg, args):
             torch.save(checkpoint, osp.join(checkpoint_path, "best.pth"))
 
         # evaluate model
-        if int(iteration / train_eval_interval) % cfg.train.save_interval == 0:
-            pass  # TODO implement evaluate functions
-            # evaluate(model, val_loader, iteration, writer)
-            # evaluate_micro(model, val_loader, iteration, writer)
+        if iteration % cfg.train.save_interval == 0:
+            precision, recall, f1 = evaluate(model, val_loader, val_eval_interval)
+            precision_micro, recall_micro, f1_micro = evaluate_micro(
+                model, val_loader, val_eval_interval
+            )
+            print(f"precision: {precision:.4f} | recall: {recall:.4f} | f1: {f1:.4f}")
+            print(
+                f"precision_micro: {precision_micro:.4f} | recall_micro: {recall_micro:.4f} | f1_micro: {f1_micro:.4f}"
+            )
+            writer.add_scalars(
+                "metrics",
+                {"precision": precision, "recall": recall, "f1": f1},
+                iteration,
+            )
+            writer.add_scalars(
+                "metrics_micro",
+                {"precision": precision_micro, "recall": recall_micro, "f1": f1_micro},
+                iteration,
+            )
     writer.close()
 
 

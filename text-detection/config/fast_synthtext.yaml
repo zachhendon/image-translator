@@ -1,0 +1,19 @@
+model:
+    type: fast
+    kernel_loss: balanced_bce_loss
+    text_loss: dice_loss
+data:
+    batch_size: 16
+    dataset: synthtext
+train:
+    lr: 1e-3
+    min_lr: 1e-5
+    num_iterations: 100000
+    train_eval_interval: 250
+    val_eval_interval: 50
+    save_interval: 2500
+    optimizer: adamw
+    schedule: cosine_warmup
+    warmup_iterations: 5000
+    checkpoint: null
+    resume: null
