@@ -84,15 +84,12 @@ class Neck(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # self.reduce2 = nn.Conv2d(64, 128, 3, padding=1, bias=False)
-        # self.reduce3 = nn.Conv2d(128, 128, 3, padding=1, bias=False)
-        # self.reduce4 = nn.Conv2d(256, 128, 3, padding=1, bias=False)
-        # self.reduce5 = nn.Conv2d(512, 128, 3, padding=1, bias=False)
         self.reduce5 = nn.Conv2d(512, 128, kernel_size=1, bias=False)
         self.reduce4 = nn.Conv2d(256, 128, kernel_size=1, bias=False)
         self.reduce3 = nn.Conv2d(128, 128, kernel_size=1, bias=False)
         self.reduce2 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
 
+        self.smooth5 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
         self.smooth4 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
         self.smooth3 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
         self.smooth2 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
@@ -105,9 +102,6 @@ class Neck(nn.Module):
 
     def upsample_cat(self, p2, p3, p4, p5):
         size = p2.size()[2:]
-        # p3 = F.interpolate(p3, size=size, mode="bilinear")
-        # p4 = F.interpolate(p4, size=size, mode="bilinear")
-        # p5 = F.interpolate(p5, size=size, mode="bilinear")
         p3 = F.interpolate(p3, size=size)
         p4 = F.interpolate(p4, size=size)
         p5 = F.interpolate(p5, size=size)
@@ -116,25 +110,18 @@ class Neck(nn.Module):
     def forward(self, x):
         c2, c3, c4, c5 = x
 
-        # TODO smooth layers
         p5 = self.reduce5(c5)
-        # p4 = F.interpolate(p5, size=c4.size()[2:], mode="bilinear") + self.reduce4(c4)
-        # p3 = F.interpolate(p4, size=c3.size()[2:], mode="bilinear") + self.reduce3(c3)
-        # p2 = F.interpolate(p3, size=c2.size()[2:], mode="bilinear") + self.reduce2(c2)
         p4 = F.interpolate(p5, size=c4.size()[2:]) + self.reduce4(c4)
-        p4 = self.smooth4(p4)
         p3 = F.interpolate(p4, size=c3.size()[2:]) + self.reduce3(c3)
-        p3 = self.smooth3(p3)
         p2 = F.interpolate(p3, size=c2.size()[2:]) + self.reduce2(c2)
+        p5 = self.smooth5(p5)
+        p4 = self.smooth4(p4)
+        p3 = self.smooth3(p3)
         p2 = self.smooth2(p2)
 
         p = self.upsample_cat(p2, p3, p4, p5)
         p = self.conv(p)
         return p
-
-
-loss_kernel_fn = nn.BCELoss()
-loss_text_fn = nn.BCELoss()
 
 
 class Head(nn.Module):

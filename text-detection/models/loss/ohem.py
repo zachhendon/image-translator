@@ -1,23 +1,25 @@
 import torch
 
 
-def get_ohem_masks(pred, gt, masks, ratio=3.0):
+def get_ohem_masks(preds, gt_texts, gt_texts_ignore, ratio=3.0):
     ohem_masks = []
-    for i in range(len(pred)):
-        num_pos = int(torch.sum(gt[i] > 0.5)) - int(
-            torch.sum((gt[i] > 0.5) & (masks[i] <= 0.5))
-        )
-        num_neg = int(min(torch.sum(gt[i] <= 0.5), num_pos * ratio))
+    gt_texts = torch.clamp(gt_texts, 0, 1)
+    gt_texts_ignore = 1 - torch.clamp(gt_texts_ignore, 0, 1)
+    for i in range(len(preds)):
+        num_pos = int(torch.sum(gt_texts[i]))
+        num_neg = int(min(ratio * num_pos, torch.sum(1 - gt_texts[i])))
         if num_pos == 0 or num_neg == 0:
-            ohem_masks.append(masks[i])
+            ohem_masks.append(gt_texts_ignore[i])
             continue
 
-        neg_pred = pred[i][gt[i] <= 0.5]
+        neg_pred = preds[i] * (1 - gt_texts[i])
         threshold = torch.sort(neg_pred.view(-1), descending=True)[0][
             num_neg - 1
         ].item()
+
         mask = torch.bitwise_and(
-            torch.bitwise_or((pred[i] >= threshold), gt[i] > 0.5), (masks[i] > 0.5)
+            torch.bitwise_or(preds[i] >= threshold, gt_texts[i] > 0.5),
+            gt_texts_ignore[i] > 0.5,
         )
-        ohem_masks.append(mask)
+        ohem_masks.append(mask.float())
     return torch.stack(ohem_masks)

@@ -5,7 +5,7 @@ import argparse
 import os
 import os.path as osp
 from glob import glob
-from models.utils import evaluate, evaluate_micro
+from models.utils import evaluate_micro
 from hydra import compose, initialize
 from loader import *
 from models.fast import FAST
@@ -29,6 +29,7 @@ def get_run_id(cfg):
 
 def calculate_total_loss(kernel_loss, text_loss):
     return kernel_loss + 0.5 * text_loss
+    # return 5 * kernel_loss + text_loss
 
 
 def main(cfg, args):
@@ -56,9 +57,13 @@ def main(cfg, args):
     # kernel loss
     if cfg.model.kernel_loss == "balanced_bce_loss":
         kernel_loss_fn = BalancedBCELoss()
+    elif cfg.model.kernel_loss == "dice_loss":
+        kernel_loss_fn = DiceLoss()
 
     # text loss
-    if cfg.model.text_loss == "dice_loss":
+    if cfg.model.text_loss == "balanced_bce_loss":
+        text_loss_fn = BalancedBCELoss()
+    elif cfg.model.text_loss == "dice_loss":
         text_loss_fn = DiceLoss()
 
     # optimizer
@@ -117,7 +122,7 @@ def main(cfg, args):
         train_text_running_loss = 0.0
         train_running_loss = 0.0
 
-        for i in range(train_eval_interval):
+        for _ in range(train_eval_interval):
             images, kernel_masks, ignore_kernel_masks, text_masks, ignore_text_masks = (
                 next(train_loader)
             )
@@ -126,11 +131,22 @@ def main(cfg, args):
 
             preds = model(images)
             dilated_preds = torch.nn.functional.max_pool2d(
-                preds, kernel_size=9, stride=1, padding=4
+                preds * (1 - torch.clamp(ignore_text_masks, 0, 1)),
+                kernel_size=9,
+                stride=1,
+                padding=4,
             )
 
-            loss_kernel = kernel_loss_fn(preds, kernel_masks, ignore_kernel_masks)
-            loss_text = text_loss_fn(dilated_preds, text_masks, ignore_text_masks)
+            selected_kernel_masks = 1 - torch.clamp(ignore_text_masks, 0, 1)
+            # selected_kernel_masks = get_ohem_masks(
+            #     preds, kernel_masks, ignore_kernel_masks
+            # )
+            loss_kernel = kernel_loss_fn(preds, kernel_masks, selected_kernel_masks)
+            # selected_text_masks = 1 - torch.clamp(ignore_text_masks, 0, 1)
+            selected_text_masks = get_ohem_masks(
+                dilated_preds, text_masks, ignore_text_masks
+            )
+            loss_text = text_loss_fn(dilated_preds, text_masks, selected_text_masks)
             loss = calculate_total_loss(loss_kernel, loss_text)
             loss.backward()
 
@@ -140,11 +156,9 @@ def main(cfg, args):
             train_kernel_running_loss += loss_kernel.item()
             train_text_running_loss += loss_text.item()
             train_running_loss += loss.item()
-        train_kernel_loss = train_kernel_running_loss / (
-            train_eval_interval * batch_size
-        )
-        train_text_loss = train_text_running_loss / (train_eval_interval * batch_size)
-        train_loss = train_running_loss / (train_eval_interval * batch_size)
+        train_kernel_loss = train_kernel_running_loss / train_eval_interval
+        train_text_loss = train_text_running_loss / train_eval_interval
+        train_loss = train_running_loss / train_eval_interval
 
         # validation loop
         model.eval()
@@ -153,24 +167,33 @@ def main(cfg, args):
         val_running_loss = 0.0
 
         with torch.no_grad():
-            for _ in range(val_eval_interval):
+            for _ in range(val_eval_interval * batch_size):
                 (
                     images,
                     kernel_masks,
                     ignore_kernel_masks,
                     text_masks,
                     ignore_text_masks,
-                    _,
-                    _,
                 ) = next(val_loader)
 
                 preds = model(images)
                 dilated_preds = torch.nn.functional.max_pool2d(
-                    preds, kernel_size=9, stride=1, padding=4
+                    preds * (1 - torch.clamp(ignore_text_masks, 0, 1)),
+                    kernel_size=9,
+                    stride=1,
+                    padding=4,
                 )
 
-                loss_kernel = kernel_loss_fn(preds, kernel_masks, ignore_kernel_masks)
-                loss_text = text_loss_fn(dilated_preds, text_masks, ignore_text_masks)
+                selected_kernel_masks = 1 - torch.clamp(ignore_text_masks, 0, 1)
+                # selected_kernel_masks = get_ohem_masks(
+                #     preds, kernel_masks, ignore_kernel_masks
+                # )
+                loss_kernel = kernel_loss_fn(preds, kernel_masks, selected_kernel_masks)
+                # selected_text_masks = 1 - torch.clamp(ignore_text_masks, 0, 1)
+                selected_text_masks = get_ohem_masks(
+                    dilated_preds, text_masks, ignore_text_masks
+                )
+                loss_text = text_loss_fn(dilated_preds, text_masks, selected_text_masks)
                 loss = calculate_total_loss(loss_kernel, loss_text)
 
                 val_kernel_running_loss += loss_kernel.item()
@@ -184,7 +207,7 @@ def main(cfg, args):
 
         # log to tensorboard
         print(
-            f"[Iter {iteration}] | train loss: {train_loss:.5f} | val loss: {val_loss:.5f} | lr: {scheduler.get_last_lr()[0]:.7f}"
+            f"[Iter {iteration}] | train loss: {train_loss:.4f} | val loss: {val_loss:.4f} | lr: {scheduler.get_last_lr()[0]:.7f}"
         )
         writer.add_scalars(
             "kernel_loss",
@@ -214,22 +237,11 @@ def main(cfg, args):
 
         # evaluate model
         if iteration % cfg.train.save_interval == 0:
-            precision, recall, f1 = evaluate(model, val_loader, val_eval_interval)
-            precision_micro, recall_micro, f1_micro = evaluate_micro(
-                model, val_loader, val_eval_interval
-            )
+            precision, recall, f1 = evaluate_micro(model, val_loader, val_eval_interval * batch_size)
             print(f"precision: {precision:.4f} | recall: {recall:.4f} | f1: {f1:.4f}")
-            print(
-                f"precision_micro: {precision_micro:.4f} | recall_micro: {recall_micro:.4f} | f1_micro: {f1_micro:.4f}"
-            )
             writer.add_scalars(
                 "metrics",
                 {"precision": precision, "recall": recall, "f1": f1},
-                iteration,
-            )
-            writer.add_scalars(
-                "metrics_micro",
-                {"precision": precision_micro, "recall": recall_micro, "f1": f1_micro},
                 iteration,
             )
     writer.close()

@@ -105,6 +105,9 @@ def process_icdar2015(save_dir):
     train_gt_paths, val_gt_paths = train_test_split(
         gt_paths, test_size=0.2, random_state=42
     )
+    print(train_image_paths.index("data/raw/icdar2015/train_images/img_696.jpg"))
+    print(train_image_paths[781])
+    return
 
     train_subdir = f"{save_dir}/train"
     val_subdir = f"{save_dir}/val"

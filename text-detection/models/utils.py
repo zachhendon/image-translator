@@ -64,12 +64,12 @@ def get_components(img):
     labels = np.array(labels)
     labels = torch.from_numpy(labels).to(dtype=torch.float32)
 
-    for i in range(1, int(labels.max()) + 1):
-        if (labels == i).sum() <= 20:
-            labels[labels == i] = 0
-
     labels = labels.cuda()
     labels = F.max_pool2d(labels.unsqueeze(0), 9, stride=1, padding=4).squeeze(0)
+
+    for i in range(1, int(labels.max()) + 1):
+        if torch.sum(labels == i) < 250:
+            labels[labels == i] = 0
     return labels
 
 
@@ -85,13 +85,13 @@ def get_iou_matrix(pred_labels, gt_labels, pred_ids, gt_ids):
     return iou_matrix
 
 
-def match_bboxes(iou_matrix, pred_ids, gt_ids):
+def match_bboxes(iou_matrix, pred_ids, gt_ids, threshold=0.5):
     matches = []
     matched_gt = set()
 
     iou_pairs = [
         (pred_ids[i], gt_ids[j], iou_matrix[i, j])
-        for i, j in zip(*torch.where(iou_matrix > 0.5))
+        for i, j in zip(*torch.where(iou_matrix > threshold))
     ]
     iou_pairs.sort(key=lambda x: x[2], reverse=True)
 
@@ -136,56 +136,9 @@ def blur_image(image):
     )
 
 
-def get_metrics(pred, bboxes, ignore_bboxes):
-    threshold = 0.6
-
-    total_precision = 0
-    total_recall = 0
-    for i in range(len(pred)):
-        binary = (pred[i] > threshold).to(dtype=torch.float32)
-        binary = binary.cpu().numpy().astype(np.uint8)
-
-        pred_labels = get_components(binary)
-        gt_labels = get_gt_labels(bboxes[i], pred_labels.shape)
-        gt_labels_ignore = get_gt_labels(ignore_bboxes[i], pred_labels.shape)
-
-        pred_ids = np.unique(pred_labels.cpu())[1:].tolist()
-        gt_ids = np.unique(gt_labels.cpu())[1:].tolist()
-        gt_ids_ignore = np.unique(gt_labels_ignore.cpu())[1:].tolist()
-
-        iou_matrix = get_iou_matrix(pred_labels, gt_labels, pred_ids, gt_ids)
-        iou_matrix_ignore = get_iou_matrix(
-            pred_labels, gt_labels_ignore, pred_ids, gt_ids_ignore
-        )
-        matches = match_bboxes(iou_matrix, pred_ids, gt_ids)
-        matches_ignore = match_bboxes(iou_matrix_ignore, pred_ids, gt_ids_ignore)
-
-        true_positives = len(matches)
-        false_positives = len(pred_ids) - len(matches) - len(matches_ignore)
-        false_negatives = len(gt_ids) - len(matches)
-
-        if len(gt_ids) == 0:
-            precision = 0 if len(pred_ids) > 0 else 1
-            recall = 1
-        else:
-            precision = (
-                1
-                if true_positives + false_positives == 0
-                else true_positives / (true_positives + false_positives)
-            )
-            recall = (
-                1
-                if true_positives + false_negatives == 0
-                else true_positives / (true_positives + false_negatives)
-            )
-
-        total_precision += precision
-        total_recall += recall
-    return total_precision, total_recall
-
-
-def get_metrics_micro(pred, bboxes, ignore_bboxes):
-    threshold = 0.6
+def get_metrics_micro(pred, text_masks, ignore_text_masks):
+    threshold = 0.88
+    # threshold = 0.7
 
     total_tp = 0
     total_fp = 0
@@ -195,19 +148,18 @@ def get_metrics_micro(pred, bboxes, ignore_bboxes):
         binary = binary.cpu().numpy().astype(np.uint8)
 
         pred_labels = get_components(binary)
-        gt_labels = get_gt_labels(bboxes[i], pred_labels.shape)
-        gt_labels_ignore = get_gt_labels(ignore_bboxes[i], pred_labels.shape)
 
         pred_ids = np.unique(pred_labels.cpu())[1:].tolist()
-        gt_ids = np.unique(gt_labels.cpu())[1:].tolist()
-        gt_ids_ignore = np.unique(gt_labels_ignore.cpu())[1:].tolist()
+        gt_ids = np.unique(text_masks[i].cpu())[1:].tolist()
+        ignore_ids = np.unique(ignore_text_masks[i].cpu())[1:].tolist()
 
-        iou_matrix = get_iou_matrix(pred_labels, gt_labels, pred_ids, gt_ids)
-        iou_matrix_ignore = get_iou_matrix(
-            pred_labels, gt_labels_ignore, pred_ids, gt_ids_ignore
+        iou_mat = get_iou_matrix(pred_labels, text_masks[i], pred_ids, gt_ids)
+        iou_mat_ignore = get_iou_matrix(
+            pred_labels, ignore_text_masks[i], pred_ids, ignore_ids
         )
-        matches = match_bboxes(iou_matrix, pred_ids, gt_ids)
-        matches_ignore = match_bboxes(iou_matrix_ignore, pred_ids, gt_ids_ignore)
+
+        matches = match_bboxes(iou_mat, pred_ids, gt_ids)
+        matches_ignore = match_bboxes(iou_mat_ignore, pred_ids, ignore_ids)
 
         total_tp += len(matches)
         total_fp += len(pred_ids) - len(matches) - len(matches_ignore)
@@ -215,34 +167,7 @@ def get_metrics_micro(pred, bboxes, ignore_bboxes):
     return total_tp, total_fp, total_fn
 
 
-def evaluate(model, loader, iter_limit=float("inf")):
-    running_precision = 0.0
-    running_recall = 0.0
-    dataset_size = 0
-
-    model.eval()
-    with torch.no_grad():
-        iter = 0
-        while iter < iter_limit:
-            images, _, _, _, _, bboxes, ignore_bboxes = next(loader)
-
-            batch_size = len(images)
-
-            preds = model(images)
-            precision, recall = get_metrics(preds, bboxes, ignore_bboxes)
-
-            running_precision += precision
-            running_recall += recall
-            dataset_size += batch_size
-            iter += 1
-
-    avg_precision = running_precision / dataset_size
-    avg_recall = running_recall / dataset_size
-    avg_f1 = 2 * avg_precision * avg_recall / (avg_precision + avg_recall)
-    return avg_precision, avg_recall, avg_f1
-
-
-def evaluate_micro(model, loader, iter_limit=float("inf")):
+def evaluate_micro(model, loader, iter_limit):
     num_tp = 0
     num_fp = 0
     num_fn = 0
@@ -251,17 +176,20 @@ def evaluate_micro(model, loader, iter_limit=float("inf")):
     with torch.no_grad():
         iter = 0
         while iter < iter_limit:
-            images, _, _, _, _, bboxes, ignore_bboxes = next(loader)
+            images, _, _, text_masks, ignore_text_masks = next(loader)
 
             preds = model(images)
             true_positives, false_positives, false_negatives = get_metrics_micro(
-                preds, bboxes, ignore_bboxes
+                preds, text_masks, ignore_text_masks
             )
             num_tp += true_positives
             num_fp += false_positives
             num_fn += false_negatives
 
             iter += 1
+
+    if num_tp == 0:
+        return 0, 0, 0
     precision = num_tp / (num_tp + num_fp)
     recall = num_tp / (num_tp + num_fn)
     f1 = 2 * precision * recall / (precision + recall)
