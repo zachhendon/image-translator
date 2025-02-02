@@ -1,497 +1,305 @@
+import numpy as np
+import albumentations as A
+from torch.utils.data import Dataset, DataLoader
+from glob import glob
+import cv2 as cv
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from shapely.geometry import Polygon
+import time
 from torchvision.io import read_file, decode_jpeg
 import kornia.augmentation as K
-from kornia.geometry.transform import rescale
 from kornia.utils import draw_convex_polygon
-from glob import glob
 import math
-import random
 
 
-class FastDataset(Dataset):
-    def __init__(self, datadir, train, ignore, batch):
-        self.datadir = datadir
-        self.train = train
-        self.ignore = ignore
-        self.batch = batch
+def random_scale(image, scales=[0.5, 2.0], aspects=[0.9, 1.1]):
+    scale = np.random.uniform(scales[0], scales[1])
+    h, w = image.shape[2:]
+    if aspects:
+        aspect = np.random.uniform(aspects[0], aspects[1])
+        h_scale = scale * aspect
+        w_scale = scale / aspect
+    else:
+        h_scale = scale
+        w_scale = scale
 
-        self.num_images = len(glob(f"{datadir}/images/*.jpg"))
+    image = F.interpolate(image, size=(int(h * h_scale), int(w * w_scale)))
+    return image, (h_scale, w_scale)
 
-        self.data_keys = [
-            "image",
-            "mask",
-            "keypoints",
-            "keypoints",
-            "keypoints",
-            "keypoints",
-        ]
-        self.aug = K.AugmentationSequential(
-            K.RandomGaussianNoise(mean=0, std=0.05, p=1),
-            K.RandomGaussianBlur((3, 3), (0.1, 2.0)),
-            K.RandomSharpness(sharpness=0.1, p=1),
-            K.ColorJiggle(0.2, 0.2, 0.2, 0.2, p=0.5),
-            K.RandomPerspective(distortion_scale=0.1, p=1),
-            K.RandomAffine(
-                degrees=(-20, 20),
-                translate=(0.1, 0.1),
-                shear=(-5, 5),
-                p=1.0,
+
+def random_crop(image, gt_instances, crop_size=(640, 640)):
+    h, w = image.shape[1:]
+    h_crop, w_crop = crop_size
+    device = "cuda"
+
+    unique_instances = torch.unique(gt_instances)
+    num_instances = len(unique_instances)
+
+    if num_instances == 0:
+        p = torch.ones((num_instances, h, w), device=device)
+    else:
+        y_indices = torch.arange(h, device=device).view(-1, 1)
+        x_indices = torch.arange(w, device=device).view(1, -1)
+        num_y = torch.clamp(y_indices + 1, max=h_crop)
+        num_x = torch.clamp(x_indices + 1, max=w_crop)
+        factors = ((h_crop * w_crop) - (num_y * num_x)) / (
+            torch.clamp(y_indices + 1, max=h_crop)
+            * torch.clamp(x_indices + 1, max=w_crop)
+        ) + 1
+
+        instance_contributions = []
+        for val in unique_instances[1:]:
+            mask = gt_instances == val
+            M = mask.float() * factors
+
+            integral = torch.zeros((h + 1, w + 1), device=device)
+            integral[1:, 1:] = torch.cumsum(torch.cumsum(M, 0), 1)
+
+            yy, xx = torch.meshgrid(
+                torch.arange(h, device=device),
+                torch.arange(w, device=device),
+                indexing="ij",
+            )
+
+            y2 = torch.clamp(yy + h_crop - 1, max=h - 1)
+            x2 = torch.clamp(xx + w_crop - 1, max=w - 1)
+
+            sum_contribution = (
+                integral[y2 + 1, x2 + 1]
+                - integral[yy, x2 + 1]
+                - integral[y2 + 1, xx]
+                + integral[yy, xx]
+            )
+
+            instance_pixels = mask.sum()
+            if instance_pixels > 0:
+                sum_contribution /= instance_pixels
+                instance_contributions.append(sum_contribution)
+
+        p = torch.clamp(
+            (
+                torch.stack(instance_contributions).sum(dim=0)
+                if instance_contributions
+                else torch.zeros((h, w), device=device)
             ),
-            K.RandomHorizontalFlip(p=0.5),
-            K.RandomVerticalFlip(p=0.5),
-            data_keys=self.data_keys,
-            same_on_batch=False,
-        )
-        self.upscale = K.AugmentationSequential(
-            K.SmallestMaxSize(640),
-            data_keys=self.data_keys,
-        )
-        self.resize = K.AugmentationSequential(
-            K.Resize((640, 640)),
-            data_keys=self.data_keys,
+            min=0,
         )
 
-        self.normalize = K.Normalize(
-            mean=torch.tensor([0.485, 0.456, 0.406]),
-            std=torch.tensor([0.229, 0.224, 0.225]),
+    if p.sum() == 0:
+        p = torch.ones((h, w), device=device)
+    p /= p.sum()
+    p = p**2
+
+    p[h - h_crop + 1 :, :] = 0
+    p[:, w - w_crop + 1 :] = 0
+    p /= p.sum()
+
+    coord = torch.multinomial(p.view(-1), 1).item()
+    y_coord = coord // w
+    x_coord = coord % w
+    return y_coord, x_coord
+
+
+def scale_bboxes(bboxes, scale):
+    if type(scale) == int:
+        h_scale = scale
+        w_scale = scale
+    else:
+        h_scale, w_scale = scale
+
+    bboxes[:, :, 0] *= w_scale
+    bboxes[:, :, 1] *= h_scale
+    return bboxes
+
+
+def shrink_bboxes(bboxes):
+    rate = 0.1**2
+    shrunk_bboxes = []
+    for bbox in bboxes:
+        poly = Polygon(bbox.cpu().numpy())
+        offset = poly.area * (1 - rate) / poly.length
+        shrunk_poly = poly.buffer(-offset)
+        if shrunk_poly.is_empty:
+            shrunk_bboxes.append(bbox)
+            continue
+        shrunk_bboxes.append(list(shrunk_poly.exterior.coords)[:4])
+    shrunk_bboxes = np.array(shrunk_bboxes).reshape(-1, 4, 2).astype(np.int32)
+    return torch.from_numpy(shrunk_bboxes).to(device="cuda")
+
+
+class FAST_IC15(Dataset):
+    def __init__(self, type, short_size=640):
+        self.type = type
+        self.short_size = short_size
+        self.data_keys = ["image", "keypoints", "keypoints"]
+        self.transforms = K.AugmentationSequential(
+            K.RandomHorizontalFlip(p=0.5),
+            K.RandomAffine(degrees=30, shear=20, translate=(0.1, 0.1), p=1.0),
+            K.RandomGaussianBlur((3, 3), (0.1, 2.0), p=0.5),
+            K.ColorJiggle(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
+            K.Normalize(
+                mean=torch.tensor([0.485, 0.456, 0.406]),
+                std=torch.tensor([0.229, 0.224, 0.225]),
+            ),
+            same_on_batch=False,
+            data_keys=self.data_keys,
         )
 
     def __len__(self):
-        return self.num_images
+        return len(glob(f"data/processed/ic15/{self.type}/images/*"))
 
-    def load_bboxes(self, type, idx):
-        return torch.load(
-            f"{self.datadir}/{type}/{str(idx).zfill(6)}.pt",
-            weights_only=True,
-            map_location="cuda",
-        )
-
-    def preprocess_bboxes(self, bboxes, batch_size):
-        max_len = max([len(bb) for bb in bboxes])
-        for i, kp in enumerate(bboxes):
-            bboxes[i] = torch.cat([kp, torch.zeros(max_len - len(kp), 4, 2).cuda()])
-        bboxes = torch.stack(bboxes).reshape(batch_size, -1, 2)
-        return bboxes
-
-    def get_masks(self, bboxes, min_bboxes, size):
-        if bboxes.shape[0] == 0:
-            return (
-                torch.zeros((1, *size), device="cuda"),
-                torch.zeros((1, *size), device="cuda"),
-            )
-
-        fill_value = torch.tensor([1.0], device="cuda")
-
-        text_masks = torch.zeros((bboxes.shape[0], 1, *size), device="cuda")
-        text_masks = draw_convex_polygon(text_masks, bboxes, fill_value)
-
-        kernel_masks = -F.max_pool2d(-text_masks, kernel_size=9, stride=1, padding=4)
-        min_kernel_masks = torch.zeros((bboxes.shape[0], 1, *size), device="cuda")
-        min_kernel_masks = draw_convex_polygon(min_kernel_masks, min_bboxes, fill_value)
-
-        for i in range(len(kernel_masks)):
-            kernel_masks[i] = torch.clamp(
-                kernel_masks[i] + min_kernel_masks[i], 0, 1
-            ) * (i + 1)
-            text_masks[i] = text_masks[i] * (i + 1)
-        kernel_masks, _ = torch.max(kernel_masks, dim=0)
-        text_masks, _ = torch.max(text_masks, dim=0)
-
-        return kernel_masks, text_masks
-
-    def apply_augmentations(self, images, bboxes, min_bboxes, aug):
-        if self.batch:
-            images_aug, bboxes_aug, min_bboxes_aug = aug(images, bboxes, min_bboxes)
-        else:
-            images_aug = []
-            bboxes_aug = []
-            min_bboxes_aug = []
-
-            for image, bbox, min_bbox in zip(images, bboxes, min_bboxes):
-                if len(bbox.shape) == 2:
-                    bbox = bbox.unsqueeze(0)
-                    min_bbox = min_bbox.unsqueeze(0)
-                image, bbox, min_bbox = aug(image, bbox, min_bbox)
-                images_aug.append(image)
-                bboxes_aug.append(bbox)
-                min_bboxes_aug.append(min_bbox)
-        return images_aug, bboxes_aug, min_bboxes_aug
-
-    def random_scale_and_crop(self, images, target_size):
-        crop_h, crop_w = target_size
-        resize = K.SmallestMaxSize(min(crop_h, crop_w))
-
-        # scale images
-        if random.random() < 0.5:
-            scale = random.uniform(0.5, 1)
-        else:
-            scale = random.uniform(1, 2)
-
-        margin_y = max(0, (crop_h - int(scale * crop_h)))
-        margin_x = max(0, (crop_w - int(scale * crop_w)))
-        pad_left = random.randint(0, margin_x)
-        pad_right = margin_x - pad_left
-        pad_top = random.randint(0, margin_y)
-        pad_bottom = margin_y - pad_top
-        padding = (pad_left, pad_right, pad_top, pad_bottom)
-
-        images_scale = []
-        for image in images:
-            image_scale = resize(image)
-            image_scale = rescale(image_scale, (scale, scale))
-            image_scale = F.pad(image_scale, padding)
-            images_scale.append(image_scale)
-
-        # crop images
-        h, w = images_scale[0].shape[2:]
-        y_coords, x_coords = torch.where(images_scale[1][0, 0] > 0)
-        if y_coords.numel() == 0:
-            y_min, y_max = 0, h
-            x_min, x_max = 0, w
-        else:
-            y_min, y_max = y_coords.min().item(), y_coords.max().item()
-            x_min, x_max = x_coords.min().item(), x_coords.max().item()
-
-        if y_max - y_min <= crop_h:
-            margin_y = crop_h - (y_max - y_min)
-            start_y = min(random.randint(max(0, y_min - margin_y), y_min), h - crop_h)
-        else:
-            start_y = random.randint(y_min, y_max - crop_h)
-        if x_max - x_min <= crop_w:
-            margin_x = crop_w - (x_max - x_min)
-            start_x = min(random.randint(max(0, x_min - margin_x), x_min), w - crop_w)
-        else:
-            start_x = random.randint(x_min, x_max - crop_w)
-
-        images_out = []
-        for image in images_scale:
-            image_crop = image[
-                :, :, start_y : start_y + crop_h, start_x : start_x + crop_w
-            ]
-            images_out.append(image_crop)
-        return images_out
-
-    def random_scale_and_crop2(
-        self,
-        image,
-        mask,
-        bboxes,
-        min_bboxes,
-        ignore_bboxes,
-        ignore_min_bboxes,
-        target_size,
-    ):
-        # scale images
-        if random.random() < 0.5:
-            scale = random.uniform(0.5, 1)
-        else:
-            scale = random.uniform(1, 2)
-        # scale = random.uniform(0.5, 2)
-
-        image_scaled = F.interpolate(image, scale_factor=scale, mode="bilinear")
-        mask_scaled = F.interpolate(mask, scale_factor=scale, mode="bilinear")
-        bboxes_scaled = bboxes * scale
-        min_bboxes_scaled = min_bboxes * scale
-        ignore_bboxes_scaled = ignore_bboxes * scale
-        ignore_min_bboxes_scaled = ignore_min_bboxes * scale
-
-        # pad or crop images
-        if scale < 1:
-            # pad images if scale is less than 1
-            margin_left = image.shape[3] - image_scaled.shape[3]
-            margin_top = image.shape[2] - image_scaled.shape[2]
-
-            pad_left = random.randint(0, margin_left)
-            pad_right = margin_left - pad_left
-            pad_top = random.randint(0, margin_top)
-            pad_bottom = margin_top - pad_top
-
-            image_scaled = F.pad(
-                image_scaled, (pad_left, pad_right, pad_top, pad_bottom), value=0
-            )
-            mask_scaled = F.pad(
-                mask_scaled, (pad_left, pad_right, pad_top, pad_bottom), value=0
-            )
-            bbox_padding = torch.tensor([pad_left, pad_top], device="cuda")
-            bboxes_scaled += bbox_padding
-            min_bboxes_scaled += bbox_padding
-            ignore_bboxes_scaled += bbox_padding
-            ignore_min_bboxes_scaled += bbox_padding
-
-        # crop images
-        crop_size = min(image.shape[2:])
-        crop_mask = torch.ones(
-            (
-                image_scaled.shape[2] - crop_size + 1,
-                image_scaled.shape[3] - crop_size + 1,
-                len(bboxes),
-            ),
-            device="cuda",
-        )
-
-        xmin, _ = torch.min(bboxes_scaled[:, :, 0], dim=1)
-        xmax, _ = torch.max(bboxes_scaled[:, :, 0], dim=1)
-        ymin, _ = torch.min(bboxes_scaled[:, :, 1], dim=1)
-        ymax, _ = torch.max(bboxes_scaled[:, :, 1], dim=1)
-
-        start_x = torch.clamp(xmax - crop_size, 0, image_scaled.shape[3]).int()
-        end_x = torch.clamp(xmin, 0, image_scaled.shape[3]).int()
-        start_y = torch.clamp(ymax - crop_size, 0, image_scaled.shape[2]).int()
-        end_y = torch.clamp(ymin, 0, image_scaled.shape[2]).int()
-
-        scale_factor = 1 + ((xmax - xmin) + (ymax - ymin)) / (
-            (end_x - start_x) * (end_y - start_y)
-        )
-        for i in range(len(bboxes_scaled)):
-            crop_mask[start_y[i] : end_y[i], start_x[i] : end_x[i], i] *= scale_factor[
-                i
-            ]
-        crop_mask = torch.prod(crop_mask, dim=2)
-        crop_mask += 0.01 * (torch.sum(crop_mask, dim=0) + 1e-6)
-
-        # sample a crop location based on the mask
-        flattened_mask = crop_mask.flatten()
-        probabilities = flattened_mask / flattened_mask.sum()
-        sampled_index = torch.multinomial(probabilities, 1).item()
-        sampled_y, sampled_x = divmod(sampled_index, crop_mask.shape[1])
-
-        image_crop = image_scaled[
-            :, :, sampled_y : sampled_y + crop_size, sampled_x : sampled_x + crop_size
-        ]
-        mask_crop = mask_scaled[
-            :, :, sampled_y : sampled_y + crop_size, sampled_x : sampled_x + crop_size
-        ]
-        crop = torch.tensor([sampled_x, sampled_y], device="cuda")
-        bboxes_crop = bboxes_scaled - crop
-        min_bboxes_crop = min_bboxes_scaled - crop
-        ignore_bboxes_crop = ignore_bboxes_scaled - crop
-        ignore_min_bboxes_crop = ignore_min_bboxes_scaled - crop
-
-        # resize images to target size
-        image_out = F.interpolate(image_crop, size=target_size, mode="bilinear")
-        mask_out = F.interpolate(mask_crop, size=target_size, mode="bilinear")
-        bbox_resize = target_size / image_crop.shape[2]
-        bboxes_out = bboxes_crop * bbox_resize
-        min_bboxes_out = min_bboxes_crop * bbox_resize
-        ignore_bboxes_out = ignore_bboxes_crop * bbox_resize
-        ignore_min_bboxes_out = ignore_min_bboxes_crop * bbox_resize
-
-        return (
-            image_out,
-            mask_out,
-            bboxes_out,
-            min_bboxes_out,
-            ignore_bboxes_out,
-            ignore_min_bboxes_out,
-        )
-
-    def __getitem__(self, id):
+    def __getitem__(self, idx):
         # load image and bboxes
-        bytes = read_file(f"{self.datadir}/images/{str(id).zfill(6)}.jpg")
+        id = str(idx).zfill(6)
+        bytes = read_file(f"data/processed/ic15/{self.type}/images/{id}.jpg")
         image = decode_jpeg(bytes, device="cuda") / 255
-        # mask = torch.ones_like(image)
-        mask = torch.ones((1, 1, *image.shape[1:]), device="cuda")
+        image = image.unsqueeze(0)
+        bboxes = torch.from_numpy(
+            np.load(f"data/processed/ic15/{self.type}/bboxes/{id}.npy")
+        ).to(device="cuda", dtype=torch.float32)
+        ignore_bboxes = torch.from_numpy(
+            np.load(f"data/processed/ic15/{self.type}/ignore_bboxes/{id}.npy")
+        ).to(device="cuda", dtype=torch.float32)
 
-        bboxes = self.load_bboxes("bboxes", id)
-        min_bboxes = self.load_bboxes("min_bboxes", id)
-        if self.ignore:
-            ignore_bboxes = self.load_bboxes("ignore_bboxes", id)
-            ignore_min_bboxes = self.load_bboxes("min_ignore_bboxes", id)
+        # scale/pad image and bboxes for training
+        if self.type == "train":
+            image, (h_scale, w_scale) = random_scale(image, scales=[0.5, 2.0])
+            bboxes = scale_bboxes(bboxes, (h_scale, w_scale))
+            ignore_bboxes = scale_bboxes(ignore_bboxes, (h_scale, w_scale))
+
+        if self.type == "train":
+            margin_h = max(0, self.short_size - image.shape[2])
+            margin_w = max(0, self.short_size - image.shape[3])
+            pad_top = np.random.randint(0, margin_h + 1)
+            pad_bottom = margin_h - pad_top
+            pad_left = np.random.randint(0, margin_w + 1)
+            pad_right = margin_w - pad_left
+            padding = (pad_left, pad_right, pad_top, pad_bottom)
+            image = F.pad(image, padding, value=0)
+            bboxes[:, :, 0] += pad_left
+            bboxes[:, :, 1] += pad_top
+            ignore_bboxes[:, :, 0] += pad_left
+            ignore_bboxes[:, :, 1] += pad_top
+
+        # image augmentations
+        if self.type == "train":
+            image, bboxes, ignore_bboxes = self.transforms(image, bboxes, ignore_bboxes)
         else:
-            ignore_bboxes = torch.zeros((0, 4, 2), device="cuda")
-            ignore_min_bboxes = torch.zeros((0, 4, 2), device="cuda")
-
-        if self.train:
-            # apply geometric and color augmentations
-            image, mask, bboxes, min_bboxes, ignore_bboxes, ignore_min_bboxes = (
-                self.aug(
-                    image, mask, bboxes, min_bboxes, ignore_bboxes, ignore_min_bboxes
-                )
-            )
-
-            # scale and crop
-            image, mask, bboxes, min_bboxes, ignore_bboxes, ignore_min_bboxes = (
-                self.random_scale_and_crop2(
-                    image,
-                    mask,
-                    bboxes,
-                    min_bboxes,
-                    ignore_bboxes,
-                    ignore_min_bboxes,
-                    640,
-                )
-            )
-        else:
-            h, w = image.shape[1:]
-            short_size = 736
-            long_size = math.ceil((w * short_size / h) / 4) * 4
+            h, w = image.shape[2:]
+            if h <= w:
+                long_size = math.ceil((w * self.short_size / h) / 4) * 4
+                new_size = (self.short_size, long_size)
+            else:
+                long_size = math.ceil((h * self.short_size / w) / 4) * 4
+                new_size = (long_size, self.short_size)
             resize = K.AugmentationSequential(
-                K.Resize((short_size, long_size)),
-                data_keys=self.data_keys,
+                K.Resize(new_size),
                 same_on_batch=True,
+                data_keys=self.data_keys,
             )
-            image, mask, bboxes, min_bboxes, ignore_bboxes, ignore_min_bboxes = resize(
-                image, mask, bboxes, min_bboxes, ignore_bboxes, ignore_min_bboxes
+            image, bboxes, ignore_bboxes = resize(image, bboxes, ignore_bboxes)
+
+        # create masks
+        min_bboxes = shrink_bboxes(bboxes)
+        gt_instances = torch.zeros(
+            (1, 1, *image.shape[2:]), dtype=torch.int8, device="cuda"
+        )
+        training_mask = torch.ones(
+            (1, 1, *image.shape[2:]), dtype=torch.int8, device="cuda"
+        )
+        for i, bbox in enumerate(bboxes):
+            gt_instances = draw_convex_polygon(
+                gt_instances,
+                [bbox],
+                torch.tensor([i + 1], dtype=torch.uint8, device="cuda"),
             )
+        for bbox in ignore_bboxes:
+            training_mask = draw_convex_polygon(
+                training_mask,
+                [bbox],
+                torch.tensor([0], dtype=torch.uint8, device="cuda"),
+            )
+        gt_instances = gt_instances.squeeze(0).squeeze(0)
+        training_mask = training_mask.squeeze(0).squeeze(0)
 
-        # normalize images
-        image = self.normalize(image)
+        gt_kernels = [
+            torch.zeros((1, 1, *image.shape[2:]), dtype=torch.int8, device="cuda")
+        ]
+        for bbox, min_bbox in zip(bboxes, min_bboxes):
+            gt_kernel = torch.zeros(
+                (1, 1, *image.shape[2:]), dtype=torch.int8, device="cuda"
+            )
+            gt_kernel = draw_convex_polygon(
+                gt_kernel, [bbox], torch.tensor([1], dtype=torch.uint8, device="cuda")
+            )
+            gt_kernels.append(gt_kernel)
+        gt_kernels = torch.cat(gt_kernels, dim=1).to(dtype=torch.float16)
+        overlap = (gt_kernels.sum(dim=1) > 1).to(dtype=torch.float16)
+        overlap = F.max_pool2d(overlap, kernel_size=3, stride=1, padding=1)
+        gt_kernel = -F.max_pool2d(-gt_kernels, kernel_size=9, stride=1, padding=4)
+        gt_kernel = torch.clamp(torch.sum(gt_kernel, dim=1), 0, 1)
+        gt_kernel[overlap > 0] = 0
+        gt_kernel = gt_kernel.unsqueeze(0)
+        for min_bbox in min_bboxes:
+            gt_kernel = draw_convex_polygon(
+                gt_kernel,
+                [min_bbox],
+                torch.tensor([1], dtype=torch.uint8, device="cuda"),
+            )
+        gt_kernel = gt_kernel.squeeze(0).squeeze(0)
 
-        # get bbox masks
-        kernel_masks, text_masks = self.get_masks(bboxes, min_bboxes, image.shape[2:])
-        ignore_kernel_masks, ignore_text_masks = self.get_masks(
-            ignore_bboxes, ignore_min_bboxes, image.shape[2:]
-        )
-        ignore_kernel_masks[mask[0] == 0] = 1
-        ignore_text_masks[mask[0] == 0] = 1
+        gt_text = torch.clamp(gt_instances, 0, 1)
+        image = image.squeeze(0)
 
-        return (
-            image.squeeze(0),
-            kernel_masks.squeeze(0),
-            ignore_kernel_masks.squeeze(0),
-            text_masks.squeeze(0),
-            ignore_text_masks.squeeze(0),
-        )
+        # random crop
+        if self.type == "train":
+            y_coord, x_coord = random_crop(
+                image, gt_instances, crop_size=(self.short_size, self.short_size)
+            )
+            image = image[
+                :,
+                y_coord : y_coord + self.short_size,
+                x_coord : x_coord + self.short_size,
+            ]
+            gt_kernel = gt_kernel[
+                y_coord : y_coord + self.short_size, x_coord : x_coord + self.short_size
+            ]
+            gt_text = gt_text[
+                y_coord : y_coord + self.short_size, x_coord : x_coord + self.short_size
+            ]
+            training_mask = training_mask[
+                y_coord : y_coord + self.short_size, x_coord : x_coord + self.short_size
+            ]
+            gt_instances = gt_instances[
+                y_coord : y_coord + self.short_size, x_coord : x_coord + self.short_size
+            ]
 
-    # def __getitems__(self, idxs):
-    #     # load images and bboxes
-    #     bytes = []
-    #     for idx in idxs:
-    #         bytes.append(read_file(f"{self.datadir}/images/{str(idx).zfill(6)}.jpg"))
-    #     images = decode_jpeg(bytes, device="cuda")
+        # convert to float32
+        image = image.to(dtype=torch.float32)
+        gt_kernel = gt_kernel.to(dtype=torch.float32)
+        gt_text = gt_text.to(dtype=torch.float32)
+        training_mask = training_mask.to(dtype=torch.float32)
+        gt_instances = gt_instances.to(dtype=torch.float32)
 
-    #     bboxes = [self.load_bboxes("bboxes", idx) for idx in idxs]
-    #     min_bboxes = [self.load_bboxes("min_bboxes", idx) for idx in idxs]
-    #     masks = [
-    #         self.get_masks(bbox, min_bbox, images[i].shape[1:])
-    #         for i, (bbox, min_bbox) in enumerate(zip(bboxes, min_bboxes))
-    #     ]
-    #     kernel_masks, text_masks = zip(*masks)
-
-    #     if self.ignore:
-    #         ignore_bboxes = [self.load_bboxes("ignore_bboxes", idx) for idx in idxs]
-    #         ignore_min_bboxes = [
-    #             self.load_bboxes("min_ignore_bboxes", idx) for idx in idxs
-    #         ]
-    #         ignore_masks = [
-    #             self.get_masks(bbox, min_bbox, images[i].shape[1:])
-    #             for i, (bbox, min_bbox) in enumerate(
-    #                 zip(ignore_bboxes, ignore_min_bboxes)
-    #             )
-    #         ]
-    #         ignore_kernel_masks, ignore_text_masks = zip(*ignore_masks)
-    #     else:
-    #         ignore_kernel_masks = [torch.zeros_like(mask) for mask in kernel_masks]
-    #         ignore_text_masks = [torch.zeros_like(mask) for mask in text_masks]
-
-    #     # Check if images are different sizes
-    #     resize_images = len(set([img.shape for img in images])) > 1
-    #     if resize_images:
-    #         avg_h = sum([img.shape[1] for img in images]) // len(images)
-    #         avg_w = sum([img.shape[2] for img in images]) // len(images)
-    #         resize = K.Resize((avg_h, avg_w))
-
-    #         images = torch.cat([resize(img / 255) for img in images])
-    #         kernel_masks = torch.cat([resize(mask) for mask in kernel_masks])
-    #         text_masks = torch.cat([resize(mask) for mask in text_masks])
-    #         ignore_kernel_masks = torch.cat(
-    #             [resize(mask) for mask in ignore_kernel_masks]
-    #         )
-    #         ignore_text_masks = torch.cat([resize(mask) for mask in ignore_text_masks])
-    #     else:
-    #         images = torch.stack(images) / 255
-    #         kernel_masks = torch.stack(kernel_masks)
-    #         text_masks = torch.stack(text_masks)
-    #         ignore_kernel_masks = torch.stack(ignore_kernel_masks)
-    #         ignore_text_masks = torch.stack(ignore_text_masks)
-
-    #     # apply augmentations
-    #     if self.train:
-    #         images, kernel_masks, text_masks, ignore_kernel_masks, ignore_text_masks = (
-    #             self.aug(
-    #                 images,
-    #                 kernel_masks,
-    #                 text_masks,
-    #                 ignore_kernel_masks,
-    #                 ignore_text_masks,
-    #             )
-    #         )
-    #     else:
-    #         h, w = images.shape[2:]
-    #         short_size = 736
-    #         long_size = math.ceil((w * short_size / h) / 4) * 4
-    #         resize = K.AugmentationSequential(
-    #             K.Resize((short_size, long_size)),
-    #             data_keys=self.data_keys,
-    #             same_on_batch=True,
-    #         )
-    #         images, kernel_masks, text_masks, ignore_kernel_masks, ignore_text_masks = (
-    #             resize(
-    #                 images,
-    #                 kernel_masks,
-    #                 text_masks,
-    #                 ignore_kernel_masks,
-    #                 ignore_text_masks,
-    #             )
-    #         )
-
-    #     # crop images
-    #     if self.train:
-    #         images, kernel_masks, text_masks, ignore_kernel_masks, ignore_text_masks = (
-    #             self.random_scale_and_crop(
-    #                 [
-    #                     images,
-    #                     kernel_masks,
-    #                     text_masks,
-    #                     ignore_kernel_masks,
-    #                     ignore_text_masks,
-    #                 ],
-    #                 (640, 640),
-    #             )
-    #         )
-
-    #     # normalize images
-    #     images = (
-    #         images - torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
-    #     ) / torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
-
-    #     kernel_masks = torch.round(kernel_masks).squeeze(1)
-    #     text_masks = torch.round(text_masks).squeeze(1)
-    #     ignore_kernel_masks = torch.round(ignore_kernel_masks).squeeze(1)
-    #     ignore_text_masks = torch.round(ignore_text_masks).squeeze(1)
-
-    #     batch = [
-    #         images,
-    #         kernel_masks,
-    #         ignore_kernel_masks,
-    #         text_masks,
-    #         ignore_text_masks,
-    #     ]
-    #     return batch
-
-
-def collate_fn(batch):
-    images = torch.cat(batch[0])
-    kernel_masks = torch.stack(batch[1])
-    ignore_kernel_masks = torch.stack(batch[2])
-    text_masks = torch.stack(batch[3])
-    ignore_text_masks = torch.stack(batch[4])
-
-    return_batch = [
-        images,
-        kernel_masks,
-        ignore_kernel_masks,
-        text_masks,
-        ignore_text_masks,
-    ]
-    return return_batch
+        data = {
+            "images": image,
+            "gt_kernels": gt_kernel,
+            "gt_texts": gt_text,
+            "training_masks": training_mask,
+            "gt_instances": gt_instances,
+        }
+        return data
 
 
 class DataLoaderIterator:
-    def __init__(self, dataset, batch_size=16, train=True):
-        self.loader = DataLoader(dataset, batch_size=batch_size, shuffle=train)
+    def __init__(self, dataset, shuffle, batch_size=16):
+        self.loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=0,
+        )
         self.iter = iter(self.loader)
 
     def __next__(self):
@@ -501,44 +309,5 @@ class DataLoaderIterator:
             self.iter = iter(self.loader)
             return next(self.iter)
 
-
-def get_icdar2015_loaders(batch_size=16):
-    train_dataset = FastDataset(
-        "data/processed/icdar2015/train", train=True, ignore=True, batch=False
-    )
-    val_dataset = FastDataset(
-        "data/processed/icdar2015/val", train=False, ignore=True, batch=False
-    )
-    return (
-        DataLoaderIterator(
-            train_dataset,
-            batch_size,
-            train=True,
-        ),
-        DataLoaderIterator(
-            val_dataset,
-            batch_size,
-            train=False,
-        ),
-    )
-
-
-def get_synthtext_loaders(batch_size=16):
-    train_dataset = FastDataset(
-        "data/processed/synthtext/train", train=True, ignore=False, batch=False
-    )
-    val_dataset = FastDataset(
-        "data/processed/synthtext/val", train=False, ignore=False, batch=False
-    )
-    return (
-        DataLoaderIterator(
-            train_dataset,
-            batch_size,
-            train=True,
-        ),
-        DataLoaderIterator(
-            val_dataset,
-            1,
-            train=False,
-        ),
-    )
+    def __len__(self):
+        return len(self.loader)

@@ -9,6 +9,7 @@ from tqdm import tqdm
 from shapely.geometry import Polygon
 from sklearn.model_selection import train_test_split
 from scipy.io import loadmat
+import pyclipper
 
 
 def create_masks(bboxes, size):
@@ -41,7 +42,7 @@ def create_masks(bboxes, size):
 
 
 def get_min_bboxes(bboxes):
-    rate = 0.4**2
+    rate = 0.1**2
     shrunk_bboxes = []
     for bbox in bboxes:
         poly = Polygon(bbox)
@@ -51,10 +52,10 @@ def get_min_bboxes(bboxes):
             shrunk_bboxes.append(bbox)
             continue
         shrunk_bboxes.append(list(shrunk_poly.exterior.coords)[:4])
-    return np.array(shrunk_bboxes).reshape(-1, 4, 2).astype(np.float32)
+    return np.array(shrunk_bboxes).reshape(-1, 4, 2).astype(np.int32)
 
 
-def process_icdar2015_data(image_paths, gt_paths, subdir):
+def process_ic15_data(image_paths, gt_paths, subdir):
     os.makedirs(subdir, exist_ok=True)
     images_dir = f"{subdir}/images"
     bboxes_dir = f"{subdir}/bboxes"
@@ -68,52 +69,54 @@ def process_icdar2015_data(image_paths, gt_paths, subdir):
     os.makedirs(min_ignore_bboxes_dir, exist_ok=True)
     for i, (image_path, gt_path) in tqdm(enumerate(zip(image_paths, gt_paths))):
         id = str(i).zfill(6)
-        image = cv.imread(image_path)
+        image = cv.imread(image_path, cv.IMREAD_UNCHANGED)
+        # image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
         cv.imwrite(f"{images_dir}/{id}.jpg", image)
         bboxes = []
         ignore_bboxes = []
         with open(gt_path, encoding="utf-8-sig", mode="r") as f:
             for line in f:
                 gt = line.rstrip().split(",")
-                if gt[8] in ["###", "*"]:
+                if gt[8] == "###":
                     ignore_bboxes.append([gt[:8]])
                 else:
                     bboxes.append([gt[:8]])
         bboxes = np.array(bboxes, dtype=np.int32).reshape(-1, 4, 2)
         min_bboxes = get_min_bboxes(bboxes)
-        torch.save(torch.from_numpy(bboxes).float(), f"{bboxes_dir}/{id}.pt")
-        torch.save(torch.from_numpy(min_bboxes).float(), f"{min_bboxes_dir}/{id}.pt")
+        np.save(f"{bboxes_dir}/{id}.npy", bboxes)
+        np.save(f"{min_bboxes_dir}/{id}.npy", min_bboxes)
         ignore_bboxes = np.array(ignore_bboxes, dtype=np.int32).reshape(-1, 4, 2)
         min_ignore_bboxes = get_min_bboxes(ignore_bboxes)
-        torch.save(
-            torch.from_numpy(ignore_bboxes).float(), f"{ignore_bboxes_dir}/{id}.pt"
-        )
-        torch.save(
-            torch.from_numpy(min_ignore_bboxes).float(),
-            f"{min_ignore_bboxes_dir}/{id}.pt",
-        )
+        np.save(f"{ignore_bboxes_dir}/{id}.npy", ignore_bboxes)
+        np.save(f"{min_ignore_bboxes_dir}/{id}.npy", min_ignore_bboxes)
 
 
-def process_icdar2015(save_dir):
-    raw_images_dir = "data/raw/icdar2015/train_images"
-    raw_gts_dir = f"data/raw/icdar2015/train_gts"
-    image_paths = sorted(glob(f"{raw_images_dir}/*"))
-    gt_paths = sorted(glob(f"{raw_gts_dir}/*"))
+def process_ic15():
+    # process training data
+    train_images_dir = "data/raw/ic15/train_images"
+    train_gts_dir = "data/raw/ic15/train_gts"
+    train_image_paths = sorted(glob(f"{train_images_dir}/*"))
+    train_gt_paths = sorted(glob(f"{train_gts_dir}/*"))
     train_image_paths, val_image_paths = train_test_split(
-        image_paths, test_size=0.2, random_state=42
+        train_image_paths, test_size=0.2, random_state=42
     )
     train_gt_paths, val_gt_paths = train_test_split(
-        gt_paths, test_size=0.2, random_state=42
+        train_gt_paths, test_size=0.2, random_state=42
     )
-    print(train_image_paths.index("data/raw/icdar2015/train_images/img_696.jpg"))
-    print(train_image_paths[781])
-    return
 
-    train_subdir = f"{save_dir}/train"
-    val_subdir = f"{save_dir}/val"
+    train_save_dir = "data/processed/ic15/train"
+    val_save_dir = "data/processed/ic15/val"
 
-    process_icdar2015_data(train_image_paths, train_gt_paths, train_subdir)
-    process_icdar2015_data(val_image_paths, val_gt_paths, val_subdir)
+    process_ic15_data(train_image_paths, train_gt_paths, train_save_dir)
+    process_ic15_data(val_image_paths, val_gt_paths, val_save_dir)
+
+    # process test data
+    test_images_dir = "data/raw/ic15/test_images"
+    test_gts_dir = "data/raw/ic15/test_gts"
+    test_image_paths = sorted(glob(f"{test_images_dir}/*"))
+    test_gt_paths = sorted(glob(f"{test_gts_dir}/*"))
+    test_save_dir = "data/processed/ic15/test"
+    process_ic15_data(test_image_paths, test_gt_paths, test_save_dir)
 
 
 def process_synthtext_data(image_paths, bboxes, subdir):
@@ -133,6 +136,7 @@ def process_synthtext_data(image_paths, bboxes, subdir):
         min_bbox = get_min_bboxes(bbox)
         torch.save(torch.from_numpy(bbox).float(), f"{bboxes_dir}/{id}.pt")
         torch.save(torch.from_numpy(min_bbox).float(), f"{min_bboxes_dir}/{id}.pt")
+
 
 def process_synthtext(save_dir):
     data = loadmat("data/raw/synthtext/gt.mat")
@@ -160,11 +164,9 @@ def process_synthtext(save_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", "-d", type=str, required=True)
-    parser.add_argument("--save", "-s", type=str, required=True)
 
     args = parser.parse_args()
-    save_dir = f"data/processed/{args.save}"
-    if args.dataset == "icdar2015":
-        process_icdar2015(save_dir)
+    if args.dataset == "ic15":
+        process_ic15()
     elif args.dataset == "synthtext":
-        process_synthtext(save_dir)
+        process_synthtext()

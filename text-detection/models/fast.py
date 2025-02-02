@@ -120,7 +120,7 @@ class Neck(nn.Module):
         p2 = self.smooth2(p2)
 
         p = self.upsample_cat(p2, p3, p4, p5)
-        p = self.conv(p)
+        # p = self.conv(p)
         return p
 
 

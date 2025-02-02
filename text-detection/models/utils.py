@@ -65,11 +65,12 @@ def get_components(img):
     labels = torch.from_numpy(labels).to(dtype=torch.float32)
 
     labels = labels.cuda()
-    labels = F.max_pool2d(labels.unsqueeze(0), 9, stride=1, padding=4).squeeze(0)
+    # labels = F.max_pool2d(labels.unsqueeze(0), 9, stride=1, padding=4).squeeze(0)
 
     for i in range(1, int(labels.max()) + 1):
-        if torch.sum(labels == i) < 250:
+        if torch.sum(labels == i) < 50:
             labels[labels == i] = 0
+    labels = F.max_pool2d(labels.unsqueeze(0), 9, stride=1, padding=4).squeeze(0)
     return labels
 
 
@@ -138,36 +139,31 @@ def blur_image(image):
 
 def get_metrics_micro(pred, text_masks, ignore_text_masks):
     threshold = 0.88
-    # threshold = 0.7
 
     total_tp = 0
     total_fp = 0
     total_fn = 0
     for i in range(len(pred)):
-        binary = (pred[i] > threshold).to(dtype=torch.float32)
+        binary = (pred[i] * ignore_text_masks[i] > threshold).to(dtype=torch.float32)
         binary = binary.cpu().numpy().astype(np.uint8)
 
         pred_labels = get_components(binary)
-
         pred_ids = np.unique(pred_labels.cpu())[1:].tolist()
         gt_ids = np.unique(text_masks[i].cpu())[1:].tolist()
-        ignore_ids = np.unique(ignore_text_masks[i].cpu())[1:].tolist()
 
         iou_mat = get_iou_matrix(pred_labels, text_masks[i], pred_ids, gt_ids)
-        iou_mat_ignore = get_iou_matrix(
-            pred_labels, ignore_text_masks[i], pred_ids, ignore_ids
-        )
-
         matches = match_bboxes(iou_mat, pred_ids, gt_ids)
-        matches_ignore = match_bboxes(iou_mat_ignore, pred_ids, ignore_ids)
 
-        total_tp += len(matches)
-        total_fp += len(pred_ids) - len(matches) - len(matches_ignore)
-        total_fn += len(gt_ids) - len(matches)
+        cur_tp = len(matches)
+        cur_fp = len(pred_ids) - len(matches)
+        cur_fn = len(gt_ids) - len(matches)
+        total_tp += cur_tp
+        total_fp += cur_fp
+        total_fn += cur_fn
     return total_tp, total_fp, total_fn
 
 
-def evaluate_micro(model, loader, iter_limit):
+def evaluate_micro(model, loader, iter_limit=None):
     num_tp = 0
     num_fp = 0
     num_fn = 0
@@ -175,12 +171,15 @@ def evaluate_micro(model, loader, iter_limit):
     model.eval()
     with torch.no_grad():
         iter = 0
-        while iter < iter_limit:
-            images, _, _, text_masks, ignore_text_masks = next(loader)
+        # while iter < iter_limit:
+        for batch in loader:
+            images = batch["images"]
+            training_masks = batch["training_masks"]
+            gt_instances = batch["gt_instances"]
 
             preds = model(images)
             true_positives, false_positives, false_negatives = get_metrics_micro(
-                preds, text_masks, ignore_text_masks
+                preds, gt_instances, training_masks
             )
             num_tp += true_positives
             num_fp += false_positives
@@ -194,3 +193,16 @@ def evaluate_micro(model, loader, iter_limit):
     recall = num_tp / (num_tp + num_fn)
     f1 = 2 * precision * recall / (precision + recall)
     return precision, recall, f1
+
+
+def get_iou(pred, gt, mask):
+    threshold = 0.88
+    eps = 1e-4
+    binary = (pred > threshold).to(dtype=torch.int8)
+    gt = gt.to(dtype=torch.int8)
+    mask = mask.to(dtype=torch.int8)
+
+    intersection = (binary & gt & mask).sum(dim=(1, 2)) + eps
+    union = ((binary | gt) & mask).sum(dim=(1, 2)) + eps
+    iou = (intersection / union).mean()
+    return iou.item()
