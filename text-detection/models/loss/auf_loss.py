@@ -5,20 +5,20 @@ import torch.nn as nn
 class AUFLoss(nn.Module):
     def __init__(self, lmb=0.5, delta=0.6, gamma=0.5):
         super().__init__()
-        self.eps = 1e-6
+        self.eps = 1e-10
         self.lmb = lmb
         self.delta = delta
         self.gamma = gamma
 
     def forward(self, pred, gt, mask):
-        pred = torch.clamp(pred, self.eps, 1 - self.eps)
-        mask = torch.clamp(mask, self.eps, 1 - self.eps)
+        pred = torch.clamp(pred * mask, self.eps, 1 - self.eps) 
+        gt = torch.clamp(gt * mask, self.eps, 1 - self.eps) 
 
         N = torch.sum(mask, dim=(1, 2))
         maf_loss = (-self.delta / N * torch.sum(gt * torch.log(pred), dim=(1, 2))) - (
             (1 - self.delta)
             / N
-            * torch.sum((1 - pred) ** self.gamma * torch.log(1 - pred), dim=(1, 2))
+            * torch.sum((pred) ** self.gamma * torch.log(pred), dim=(1, 2))
         )
 
         mTI_neg = torch.sum((1 - pred) * (1 - gt), dim=(1, 2)) / (

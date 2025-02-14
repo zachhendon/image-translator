@@ -1,0 +1,26 @@
+model:
+    type: fast
+    kernel_loss: 
+        loss_fn: auf_loss
+        gamma: 0.5
+        ohem: false
+    text_loss: 
+        loss_fn: auf_loss
+        gamma: 0.9
+        ohem: false
+data:
+    batch_size: 16
+    dataset: ic15
+train:
+    lr: 1e-3
+    num_iterations: 100000
+    train_eval_interval: 50
+    val_eval_interval: null
+    save_interval: 1000
+    optimizer: adamw
+    schedule: poly
+    warmup: true
+    warmup_iterations: 5000
+    checkpoint: null
+    resume: null
+

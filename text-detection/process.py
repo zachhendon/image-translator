@@ -9,7 +9,8 @@ from tqdm import tqdm
 from shapely.geometry import Polygon
 from sklearn.model_selection import train_test_split
 from scipy.io import loadmat
-import pyclipper
+
+# import pyclipper
 
 
 def create_masks(bboxes, size):
@@ -70,8 +71,7 @@ def process_ic15_data(image_paths, gt_paths, subdir):
     for i, (image_path, gt_path) in tqdm(enumerate(zip(image_paths, gt_paths))):
         id = str(i).zfill(6)
         image = cv.imread(image_path, cv.IMREAD_UNCHANGED)
-        # image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
-        cv.imwrite(f"{images_dir}/{id}.jpg", image)
+
         bboxes = []
         ignore_bboxes = []
         with open(gt_path, encoding="utf-8-sig", mode="r") as f:
@@ -81,14 +81,35 @@ def process_ic15_data(image_paths, gt_paths, subdir):
                     ignore_bboxes.append([gt[:8]])
                 else:
                     bboxes.append([gt[:8]])
-        bboxes = np.array(bboxes, dtype=np.int32).reshape(-1, 4, 2)
-        min_bboxes = get_min_bboxes(bboxes)
+        bboxes = np.array(bboxes, dtype=np.float32).reshape(-1, 4, 2)
+        ignore_bboxes = np.array(ignore_bboxes, dtype=np.float32).reshape(-1, 4, 2)
+
+        # # pad images and bboxes to square
+        # h, w = image.shape[:2]
+        # if h > w:
+        #     # pad = (h - w) // 2
+        #     pad_left = (h - w) // 2
+        #     pad_right = (h - w) - pad_left
+        #     image = np.pad(
+        #         image,
+        #         ((0, 0), (pad_left, pad_right), (0, 0)),
+        #         mode="constant",
+        #         constant_values=0,
+        #     )
+        #     bboxes[:, :, 0] += pad_left
+        #     ignore_bboxes[:, :, 0] += pad_left
+        # elif w > h:
+        #     pad_top = (w - h) // 2
+        #     pad_bottom = (w - h) - pad_top
+        #     image = np.pad(
+        #         image, ((pad_top, pad_bottom), (0, 0), (0, 0)), mode="constant", constant_values=0
+        #     )
+        #     bboxes[:, :, 1] += pad_top
+        #     ignore_bboxes[:, :, 1] += pad_top
+
+        cv.imwrite(f"{images_dir}/{id}.jpg", image)
         np.save(f"{bboxes_dir}/{id}.npy", bboxes)
-        np.save(f"{min_bboxes_dir}/{id}.npy", min_bboxes)
-        ignore_bboxes = np.array(ignore_bboxes, dtype=np.int32).reshape(-1, 4, 2)
-        min_ignore_bboxes = get_min_bboxes(ignore_bboxes)
         np.save(f"{ignore_bboxes_dir}/{id}.npy", ignore_bboxes)
-        np.save(f"{min_ignore_bboxes_dir}/{id}.npy", min_ignore_bboxes)
 
 
 def process_ic15():

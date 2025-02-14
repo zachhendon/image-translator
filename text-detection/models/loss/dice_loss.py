@@ -7,9 +7,8 @@ class DiceLoss(nn.Module):
         super().__init__()
 
     def forward(self, pred, gt, mask):
-        gt = torch.clamp(gt, 0, 1)
-
         pred = pred * mask
+        gt = torch.clamp(gt, 0, 1) * mask
 
         a = torch.sum(pred * gt, dim=(1, 2))
         b = torch.sum(pred * pred, dim=(1, 2))

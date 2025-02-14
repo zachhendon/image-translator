@@ -1,0 +1,335 @@
+from nvidia.dali import pipeline_def, fn, types
+from nvidia.dali.auto_aug import trivial_augment, augmentations
+from nvidia.dali.plugin.pytorch import DALIGenericIterator
+from nvidia.dali.plugin.pytorch.fn import torch_python_function
+from nvidia.dali.plugin.base_iterator import LastBatchPolicy
+import torch
+import torch.nn.functional as F
+from kornia.utils import draw_convex_polygon
+from shapely.geometry import Polygon
+import math
+import time
+
+
+def fast_binary_avgpool2d(mask, kernel_size):
+    cumsum_h = torch.cumsum(mask, dim=2)
+    cumsum_2d = torch.cumsum(cumsum_h, dim=3)
+
+    top_left = cumsum_2d[:, :, :-kernel_size, :-kernel_size]
+    bottom_right = cumsum_2d[:, :, kernel_size:, kernel_size:]
+    top_right = cumsum_2d[:, :, :-kernel_size, kernel_size:]
+    bottom_left = cumsum_2d[:, :, kernel_size:, :-kernel_size]
+
+    window_sums = bottom_right + top_left - top_right - bottom_left
+    return window_sums / kernel_size**2
+
+
+def get_crop_size(images):
+    min_size = min(images.shape[:2])
+    return torch.tensor([min_size, min_size], device="cuda")
+
+
+def pad_images(image, bboxes, ignore_bboxes):
+    h, w = image.shape[:2]
+    extra_padding = int(min(h, w) * 0.25)
+    if h > w:
+        pad_left = (h - w) // 2
+        pad_right = (h - w) - pad_left
+        pad_top = extra_padding
+        pad_bottom = extra_padding
+    elif w > h:
+        pad_left = extra_padding
+        pad_right = extra_padding
+        pad_top = (w - h) // 2
+        pad_bottom = (w - h) - pad_top
+    image = F.pad(
+        image.permute(2, 0, 1), (pad_left, pad_right, pad_top, pad_bottom)
+    ).permute(1, 2, 0)
+    bbox_offset = torch.tensor([pad_left, pad_top], device="cuda")
+    bboxes += bbox_offset
+    ignore_bboxes += bbox_offset
+    return image, bboxes, ignore_bboxes
+
+
+def random_crop(image, bboxes, short_size, gamma=2):
+    device = image.device
+    h, w = image.shape[:2]
+
+    mask = torch.zeros((len(bboxes), 1, h, w), device=device, dtype=torch.uint8)
+    mask = draw_convex_polygon(mask, bboxes, torch.tensor([1], device=device))
+    p = fast_binary_avgpool2d(mask, kernel_size=short_size).squeeze(1)
+    torch.cuda.synchronize()
+    p = torch.clamp(p, min=0)
+    p /= torch.sum(p, dim=(1, 2), keepdim=True) + 1e-6
+    p = torch.sum(p, dim=0)
+    if p.sum() == 0:
+        p += 1
+    coord = torch.multinomial(p.view(-1), 1)
+    y_coord, x_coord = coord // p.shape[1], coord % p.shape[1]
+    return x_coord, y_coord, p
+
+
+def random_scale_and_crop(image, bboxes, ignore_bboxes, short_size, scale):
+    crop_scale = int(short_size / scale)
+
+    start_x, start_y, p = random_crop(image, bboxes, short_size)
+    image = image[start_y : start_y + crop_scale, start_x : start_x + crop_scale]
+    image = (
+        F.interpolate(
+            image.permute(2, 0, 1).unsqueeze(0), size=(short_size, short_size)
+        )
+        .squeeze(0)
+        .permute(1, 2, 0)
+    )
+    if bboxes.numel() > 0:
+        bboxes = (bboxes - torch.tensor([start_x, start_y], device="cuda")) * scale
+    if ignore_bboxes.numel() > 0:
+        ignore_bboxes = (
+            ignore_bboxes - torch.tensor([start_x, start_y], device="cuda")
+        ) * scale
+    return (
+        image,
+        bboxes,
+        ignore_bboxes,
+        # p,
+    )
+
+
+def resize(images, bboxes, ignore_bboxes, train, short_size):
+    h, w = images.shape[:2]
+    if train:
+        resize_h, resize_w = (short_size, short_size)
+    else:
+        if h <= w:
+            resize_h = short_size
+            resize_w = math.ceil((w * short_size / h) / 4) * 4
+        else:
+            resize_h = math.ceil((h * short_size / w) / 4) * 4
+            resize_w = short_size
+
+    bbox_scale = torch.tensor([resize_h / h, resize_w / w], device="cuda")
+    images = (
+        F.interpolate(images.permute(2, 0, 1).unsqueeze(0), size=(resize_h, resize_w))
+        .squeeze(0)
+        .permute(1, 2, 0)
+    )
+    if bboxes.numel() > 0:
+        bboxes *= bbox_scale
+    if ignore_bboxes.numel() > 0:
+        ignore_bboxes *= bbox_scale
+    return images, bboxes, ignore_bboxes
+
+
+def shrink_bboxes(bboxes):
+    rate = 0.5**2
+    shrunk_bboxes = []
+    for bbox in bboxes:
+        poly = Polygon(bbox.cpu().numpy())
+        offset = poly.area * (1 - rate) / poly.length
+        shrunk_poly = poly.buffer(-offset)
+        if shrunk_poly.is_empty:
+            shrunk_bboxes.append(bbox)
+            continue
+        shrunk_bboxes.append(list(shrunk_poly.exterior.coords)[:4])
+    shrunk_bboxes = torch.tensor(shrunk_bboxes, device="cuda")
+    return shrunk_bboxes
+
+
+def generate_masks(image, bboxes, ignore_bboxes):
+    min_bboxes = shrink_bboxes(bboxes)
+    min_ignore_bboxes = shrink_bboxes(ignore_bboxes)
+    h, w = image.shape[:2]
+
+    gt_kernels = torch.zeros((h, w), device="cuda")
+    gt_text = torch.zeros((h, w), device="cuda")
+    training_masks = torch.ones((h, w), device="cuda")
+    gt_instances = torch.zeros((h, w), device="cuda")
+
+    if bboxes.numel() > 0:
+        # create gt instances
+        gt_instances = torch.zeros(
+            (len(bboxes), 1, h, w), device="cuda", dtype=torch.uint8
+        )
+        color = torch.arange(1, len(bboxes) + 1, device="cuda", dtype=torch.uint8).view(
+            -1, 1
+        )
+        gt_instances = draw_convex_polygon(gt_instances, bboxes, color)
+        gt_kernels = torch.clamp(gt_instances, max=1)
+        gt_instances = torch.max(gt_instances, dim=0)[0].squeeze(0)
+        gt_text = torch.clamp(gt_instances, max=1)
+
+        # create gt kernels
+        overlap = (gt_kernels.sum(axis=0) > 1).to(dtype=torch.float16).unsqueeze(0)
+        overlap = F.max_pool2d(overlap, kernel_size=3, stride=1, padding=1)
+        gt_kernels = -F.max_pool2d(
+            -gt_kernels.to(dtype=torch.float16), kernel_size=9, stride=1, padding=4
+        ).to(dtype=torch.uint8)
+        gt_kernels = torch.max(gt_kernels, dim=0)[0].unsqueeze(0)
+        gt_kernels[overlap > 0] = 0
+
+        gt_kernels_min = torch.zeros((len(bboxes), 1, h, w), device="cuda")
+        gt_kernels_min = draw_convex_polygon(
+            gt_kernels_min, min_bboxes, torch.tensor([1], device="cuda")
+        )
+        gt_kernels = gt_kernels.squeeze(0).squeeze(0)
+
+    else:
+        gt_instances = torch.zeros((h, w), device="cuda")
+        gt_kernels = torch.zeros((h, w), device="cuda")
+        gt_text = torch.zeros((h, w), device="cuda")
+
+    if ignore_bboxes.numel() > 0:
+        # create training masks
+        training_masks = torch.ones((len(ignore_bboxes), 1, h, w), device="cuda")
+        training_masks = draw_convex_polygon(
+            training_masks, ignore_bboxes, torch.tensor([0], device="cuda")
+        )
+        training_masks = draw_convex_polygon(
+            training_masks, min_ignore_bboxes, torch.tensor([0], device="cuda")
+        )
+        training_masks = torch.min(training_masks, dim=0)[0].squeeze(0)
+    else:
+        training_masks = torch.ones((h, w), device="cuda", dtype=torch.uint8)
+
+    return (
+        gt_kernels.float(),
+        gt_text.float(),
+        training_masks.float(),
+        gt_instances.float(),
+    )
+
+
+@pipeline_def(enable_conditionals=True)
+def data_pipeline(data_dir, train=True, short_size=640):
+    jpegs, _ = fn.readers.file(
+        name="ImageReader", file_root=data_dir, shuffle_after_epoch=True, seed=42
+    )
+    images = fn.decoders.image(jpegs, device="cpu", output_type=types.RGB).gpu()
+    images1 = fn.reshape(images, layout="CHW")
+    bboxes = fn.readers.numpy(
+        file_root=f"{data_dir}/bboxes", shuffle_after_epoch=True, seed=42
+    ).gpu()
+    ignore_bboxes = fn.readers.numpy(
+        file_root=f"{data_dir}/ignore_bboxes",
+        shuffle_after_epoch=True,
+        seed=42,
+    ).gpu()
+
+    if train:
+        images, bboxes, ignore_bboxes = torch_python_function(
+            images1, bboxes, ignore_bboxes, function=pad_images, num_outputs=3
+        )
+
+        shapes = fn.peek_image_shape(jpegs)
+        center = shapes[1::-1] / 2
+
+        rotate = fn.transforms.rotation(
+            angle=fn.random.normal(mean=0, stddev=15), center=center
+        )
+        shear = fn.transforms.shear(
+            angles=fn.random.normal(mean=0, stddev=10, shape=(2,)),
+            center=center,
+        )
+        mt = fn.transforms.combine(rotate, shear)
+        images = fn.warp_affine(images, matrix=mt, fill_value=0, inverse_map=False)
+        bboxes = fn.coord_transform(bboxes, MT=mt)
+        ignore_bboxes = fn.coord_transform(ignore_bboxes, MT=mt)
+
+        scale = fn.random.uniform(range=[0.5, 2.0], device="gpu")
+        images, bboxes, ignore_bboxes = torch_python_function(
+            images,
+            bboxes,
+            ignore_bboxes,
+            short_size,
+            scale,
+            function=random_scale_and_crop,
+            num_outputs=3,
+            batch_processing=False,
+        )
+
+        images, bboxes, ignore_bboxes = torch_python_function(
+            images,
+            bboxes,
+            ignore_bboxes,
+            train,
+            short_size,
+            function=resize,
+            num_outputs=3,
+        )
+
+        images = fn.reshape(images, layout="HWC")
+        images = trivial_augment.apply_trivial_augment(
+            [
+                augmentations.brightness,
+                augmentations.contrast,
+                augmentations.color,
+                augmentations.sharpness,
+                augmentations.posterize,
+                augmentations.solarize,
+                augmentations.invert,
+                augmentations.equalize,
+            ],
+            images,
+        )
+    else:
+        images, bboxes, ignore_bboxes = torch_python_function(
+            images,
+            bboxes,
+            ignore_bboxes,
+            train,
+            short_size,
+            function=resize,
+            num_outputs=3,
+        )
+    images = fn.normalize(images)
+
+    gt_kernels, gt_texts, training_masks, gt_instances = torch_python_function(
+        images, bboxes, ignore_bboxes, function=generate_masks, num_outputs=4
+    )
+
+    images = torch_python_function(
+        images, function=lambda x: x.permute(2, 0, 1), num_outputs=1
+    )
+
+    return images, gt_kernels, gt_texts, training_masks, gt_instances
+
+
+class DALILoader:
+    def __init__(self, iterator):
+        self.iterator = iterator
+
+    def __next__(self):
+        try:
+            return next(self.iterator)
+        except StopIteration:
+            return next(self.iterator)
+
+    def __len__(self):
+        return len(self.iterator)
+
+
+def get_loader(dataset, type, short_size, batch_size=16, num_threads=4, device_id=0):
+    if type == "train":
+        train = True
+        batch_policy = LastBatchPolicy.FILL
+    else:
+        train = False
+        batch_policy = LastBatchPolicy.PARTIAL
+    data_dir = f"data/processed/{dataset}/{type}"
+
+    pipe = data_pipeline(
+        data_dir,
+        train,
+        short_size,
+        batch_size=batch_size,
+        num_threads=num_threads,
+        device_id=device_id,
+    )
+    data_iter = DALIGenericIterator(
+        [pipe],
+        ["images", "gt_kernels", "gt_texts", "training_masks", "gt_instances"],
+        reader_name="ImageReader",
+        auto_reset=True,
+        last_batch_policy=batch_policy,
+    )
+    return DALILoader(data_iter)

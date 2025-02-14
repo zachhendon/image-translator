@@ -8,7 +8,7 @@ class BCELoss(nn.Module):
         super().__init__()
 
     def forward(self, pred, gt, mask):
-        loss = F.binary_cross_entropy(pred * mask, gt.float(), reduction="none")
+        loss = F.binary_cross_entropy(pred, gt.float(), reduction="none") * mask
         balanced_loss = torch.sum(loss, dim=(1, 2)) / (
             torch.sum(mask, dim=(1, 2)) + 1e-6
         )

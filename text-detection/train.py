@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
 import argparse
 import os
 import os.path as osp
@@ -16,7 +15,11 @@ from models.schedulers import PretrainingScheduler
 from tqdm import tqdm
 import time
 from torch.utils.data import DataLoader
-from loader import FAST_IC15, DataLoaderIterator
+from loader_new import FAST_IC15, DataLoaderIterator
+import wandb
+from dali_loader import get_loader
+
+# wandb.login()
 
 
 def get_run_id(cfg):
@@ -30,40 +33,32 @@ def get_run_id(cfg):
 
 
 def calculate_total_loss(kernel_loss, text_loss):
-    return kernel_loss + 0.5 * text_loss
-    # return 5 * kernel_loss + text_loss
+    return kernel_loss + text_loss / 3
 
 
 def main(cfg, args):
-    batch_size = cfg.data.batch_size
-    if cfg.data.dataset == "icdar2015":
-        # train_loader, val_loader = get_icdar2015_loaders(batch_size=batch_size)
-        # train_dset = FAST_IC15(
-        #     split="train", is_transform=True, img_size=640, pooling_size=9
-        # )
-        # train_dset, _ = torch.utils.data.random_split(
-        #     train_dset, [800, 200], generator=torch.Generator().manual_seed(42)
-        # )
-        # train_loader = DataLoaderIterator(train_dset, batch_size, train=True)
-        # # val_loader = DataLoaderIterator(val_dset, batch_size, train=False)
-        # val_dset = FAST_IC15(
-        #     split="train",
-        #     is_transform=False,
-        #     img_size=736,
-        #     short_size=736,
-        #     pooling_size=9,
-        # )
-        # _, val_dset = torch.utils.data.random_split(
-        #     val_dset, [800, 200], generator=torch.Generator().manual_seed(42)
-        # )
-        # val_loader = DataLoader(val_dset, batch_size=batch_size, shuffle=False)
-        train_dset = FAST_IC15("train", short_size=640)
-        train_loader = DataLoaderIterator(train_dset, shuffle=True, batch_size=batch_size)
-        val_dset = FAST_IC15("val", short_size=736)
-        val_loader = DataLoaderIterator(val_dset, shuffle=True, batch_size=batch_size)
+    # def main():
+    # with initialize(version_base=None, config_path="config", job_name="test"):
+    #     cfg = compose(config_name="ic15_auf")
+    wandb.init(project="text-detection", config=dict(cfg), resume="allow")
 
-    elif cfg.data.dataset == "synthtext":
-        train_loader, val_loader = get_synthtext_loaders(batch_size=batch_size)
+    batch_size = cfg.data.batch_size
+    train_loader = get_loader(
+        cfg.data.dataset, "train", 640, batch_size=batch_size, num_threads=1
+    )
+    val_loader = get_loader(
+        cfg.data.dataset, "val", 736, batch_size=batch_size, num_threads=1
+    )
+    # if cfg.data.dataset == "ic15":
+    # train_dset = FAST_IC15("train", short_size=640)
+    # train_loader = DataLoaderIterator(
+    #     train_dset, shuffle=True, batch_size=batch_size
+    # )
+    # val_dset = FAST_IC15("val", short_size=736)
+    # val_loader = DataLoaderIterator(val_dset, shuffle=True, batch_size=batch_size)
+
+    # elif cfg.data.dataset == "synthtext":
+    #     train_loader, val_loader = get_synthtext_loaders(batch_size=batch_size)
 
     num_iterations = cfg.train.num_iterations
     if cfg.train.train_eval_interval:
@@ -86,7 +81,7 @@ def main(cfg, args):
     elif cfg.model.kernel_loss.loss_fn == "dice_loss":
         kernel_loss_fn = DiceLoss()
     elif cfg.model.kernel_loss.loss_fn == "auf_loss":
-        kernel_loss_fn = AUFLoss()
+        kernel_loss_fn = AUFLoss(gamma=cfg.model.kernel_loss.gamma)
     kernel_ohem = cfg.model.kernel_loss.ohem
 
     # text loss
@@ -95,7 +90,7 @@ def main(cfg, args):
     elif cfg.model.text_loss.loss_fn == "dice_loss":
         text_loss_fn = DiceLoss()
     elif cfg.model.text_loss.loss_fn == "auf_loss":
-        text_loss_fn = AUFLoss()
+        text_loss_fn = AUFLoss(gamma=cfg.model.text_loss.gamma)
     text_ohem = cfg.model.text_loss.ohem
 
     # optimizer
@@ -103,23 +98,48 @@ def main(cfg, args):
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr)
     elif cfg.train.optimizer == "sgd":
         optimizer = torch.optim.SGD(
-            model.parameters(), lr=cfg.train.lr, momentum=0.9, weight_decay=1e-4
+            model.parameters(),
+            lr=cfg.train.lr,
+            momentum=0.9,
+            weight_decay=1e-4,
+            nesterov=True,
+            fused=True,
         )
 
-    if cfg.train.schedule == "cosine_warmup":
-        scheduler = PretrainingScheduler(
+    # if cfg.train.schedule == "cosine_warmup":
+    #     scheduler = PretrainingScheduler(
+    #         optimizer,
+    #         total_steps=num_iterations,
+    #         warmup_steps=cfg.train.warmup_iterations,
+    #         eta_min=cfg.train.min_lr,
+    #     )
+
+    # learning rate scheduler
+    if not cfg.train.warmup:
+        warmup_iterations = 0
+    else:
+        warmup = torch.optim.lr_scheduler.LinearLR(
             optimizer,
-            total_steps=num_iterations,
-            warmup_steps=cfg.train.warmup_iterations,
-            eta_min=cfg.train.min_lr,
+            start_factor=1e-3,
+            total_iters=cfg.train.warmup_iterations,
+        )
+        warmup_iterations = cfg.train.warmup_iterations
+
+    if cfg.train.schedule == "poly":
+        scheduler = torch.optim.lr_scheduler.PolynomialLR(
+            optimizer, power=0.9, total_iters=num_iterations - warmup_iterations
+        )
+    if cfg.train.warmup:
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, [warmup, scheduler], [warmup_iterations]
         )
 
     # load checkpoint
     iteration = 0
     best_val_loss = float("inf")
-    if args.resume:
+    if cfg.train.resume:
         checkpoint = torch.load(
-            osp.join("checkpoints", args.resume, "recent.pth"), weights_only=False
+            osp.join("checkpoints", cfg.train.resume, "recent.pth"), weights_only=False
         )
         model.load_state_dict(checkpoint["model_state_dict"])
         iteration = checkpoint["iteration"]
@@ -127,35 +147,33 @@ def main(cfg, args):
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         best_val_loss = checkpoint["best_val_loss"]
 
-        checkpoint_path = osp.join("checkpoints", args.resume)
+        checkpoint_path = osp.join("checkpoints", cfg.train.resume)
         print(f"Resuming at iteration {iteration}")
     else:
-        if args.checkpoint:
+        if cfg.train.checkpoint:
             checkpoint = torch.load(
-                osp.join("checkpoints", args.checkpoint), weights_only=True
+                osp.join("checkpoints", cfg.train.checkpoint), weights_only=True
             )
             model.load_state_dict(checkpoint["model_state_dict"])
             best_val_loss = checkpoint["best_val_loss"]
-            print(f"Loaded checkpoint {args.checkpoint}")
+            print(f"Loaded checkpoint {cfg.train.checkpoint}")
 
-        run_id = get_run_id(args.config)
+        run_id = get_run_id("auf_loss")
         checkpoint_path = osp.join("checkpoints", run_id)
         os.makedirs(checkpoint_path)
-
-    # tensorboard
     print(f"Checkpoint path: {checkpoint_path}")
-    writer = SummaryWriter(log_dir=checkpoint_path)
 
     # train for num_iterations
     while iteration < num_iterations:
         # train loop
         model.train()
+        torch.cuda.empty_cache()
         train_kernel_running_loss = 0.0
         train_text_running_loss = 0.0
         train_running_loss = 0.0
 
         for _ in range(train_eval_interval):
-            batch = next(train_loader)
+            batch = next(train_loader)[0]
             images = batch["images"]
             gt_kernels = batch["gt_kernels"]
             gt_texts = batch["gt_texts"]
@@ -196,6 +214,7 @@ def main(cfg, args):
 
         # validation loop
         model.eval()
+        torch.cuda.empty_cache()
         val_kernel_running_loss = 0.0
         val_text_running_loss = 0.0
         val_running_loss = 0.0
@@ -204,7 +223,7 @@ def main(cfg, args):
 
         with torch.no_grad():
             for _ in range(val_eval_interval):
-                batch = next(val_loader)
+                batch = next(val_loader)[0]
                 images = batch["images"]
                 gt_kernels = batch["gt_kernels"]
                 gt_texts = batch["gt_texts"]
@@ -247,23 +266,20 @@ def main(cfg, args):
 
         iteration += train_eval_interval
 
-        # log to tensorboard
+        # log to wandb
         print(
             f"[Iter {iteration}] | train loss: {train_loss:.4f} | val loss: {val_loss:.4f} | IOU(kernel/text): {val_kernel_iou:.4f}/{val_text_iou:.4f} | lr: {scheduler.get_last_lr()[0]:.7f}"
         )
-        writer.add_scalars(
-            "kernel_loss",
-            {"train": train_kernel_loss, "val": val_kernel_loss},
-            iteration,
-        )
-        writer.add_scalars(
-            "text_loss", {"train": train_text_loss, "val": val_text_loss}, iteration
-        )
-        writer.add_scalars("loss", {"train": train_loss, "val": val_loss}, iteration)
-        writer.add_scalars(
-            "iou", {"kernel": val_kernel_iou, "text": val_text_iou}, iteration
-        )
-        writer.flush()
+        log = {
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "kernel_loss_train": train_kernel_loss,
+            "kernel_loss_val": val_kernel_loss,
+            "text_loss_train": train_text_loss,
+            "text_loss_val": val_text_loss,
+            "kernel_iou": val_kernel_iou,
+            "text_iou": val_text_iou,
+        }
 
         # save checkpoint
         checkpoint = {
@@ -282,14 +298,14 @@ def main(cfg, args):
 
         # evaluate model
         if iteration % cfg.train.save_interval == 0:
-            precision, recall, f1 = evaluate_micro(model, val_loader, None)
+            precision, recall, f1 = evaluate_micro(model, val_loader, val_eval_interval)
             print(f"precision: {precision:.4f} | recall: {recall:.4f} | f1: {f1:.4f}")
-            writer.add_scalars(
-                "metrics",
-                {"precision": precision, "recall": recall, "f1": f1},
-                iteration,
-            )
-    writer.close()
+            log["precision"] = precision
+            log["recall"] = recall
+            log["f1"] = f1
+
+        wandb.log(log)
+    wandb.finish()
 
 
 if __name__ == "__main__":
@@ -302,4 +318,15 @@ if __name__ == "__main__":
     with initialize(version_base=None, config_path="config", job_name="test"):
         cfg = compose(config_name=args.config)
 
+    # sweep_config = {
+    #     "method": "grid",
+    #     "metric": {"name": "f1", "goal": "minimize"},
+    #     "parameters": {
+    #         "auf_gamma": {"values": [0.9, 0.1, 0.5, 0.7, 0.3]},
+    #     },
+    # }
+    # sweep_id = wandb.sweep(sweep=sweep_config, project="text-detection")
+    # wandb.agent(sweep_id, function=main)
+
     main(cfg, args)
+    # main()
