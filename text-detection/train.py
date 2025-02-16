@@ -11,159 +11,137 @@ from models.loss.ohem import get_ohem_masks
 from models.loss.bce_loss import BCELoss
 from models.loss.dice_loss import DiceLoss
 from models.loss.auf_loss import AUFLoss
-from models.schedulers import PretrainingScheduler
 from tqdm import tqdm
 import time
 from torch.utils.data import DataLoader
 from loader_new import FAST_IC15, DataLoaderIterator
 import wandb
 from dali_loader import get_loader
-
-# wandb.login()
-
-
-def get_run_id(cfg):
-    prev_runs = glob(f"checkpoints/{cfg}*")
-    if len(prev_runs) == 0:
-        prev_run_id = -1
-    else:
-        prev_run_ids = [int(run[-3:]) for run in prev_runs]
-        prev_run_id = sorted(prev_run_ids)[-1]
-    return f"{cfg}_{str(prev_run_id + 1).zfill(3)}"
+import sys
+import ast
 
 
 def calculate_total_loss(kernel_loss, text_loss):
     return kernel_loss + text_loss / 3
 
 
-def main(cfg, args):
-    # def main():
-    # with initialize(version_base=None, config_path="config", job_name="test"):
-    #     cfg = compose(config_name="ic15_auf")
-    wandb.init(project="text-detection", config=dict(cfg), resume="allow")
+def main(args):
+    # load config and download model artifacts from wandb
+    if args.config:
+        with initialize(config_path="config"):
+            cfg = dict(compose(config_name=args.config))
 
-    batch_size = cfg.data.batch_size
+        run = wandb.init(project="text-detection", config=cfg, settings=wandb.Settings(code_dir="."))
+        if args.checkpoint:
+            artifact = run.use_artifact(
+                f"{args.checkpoint}-model-best.pt:latest", type="model"
+            )
+            artifact_path = artifact.download()
+    else:
+        run = wandb.init(project="text-detection", resume="must", id=args.resume)
+        artifact = run.use_artifact(f"{run.id}-model-recent.pt:latest", type="model")
+        artifact_path = artifact.download()
+        cfg = {k: ast.literal_eval(v) for k, v in run.config.items()}
+    
+    # data loaders
+    batch_size = cfg["data"]["batch_size"]
     train_loader = get_loader(
-        cfg.data.dataset, "train", 640, batch_size=batch_size, num_threads=1
+        cfg["data"]["dataset"], "train", 640, batch_size=batch_size, num_threads=1
     )
     val_loader = get_loader(
-        cfg.data.dataset, "val", 736, batch_size=batch_size, num_threads=1
+        cfg["data"]["dataset"], "val", 736, batch_size=batch_size, num_threads=1
     )
-    # if cfg.data.dataset == "ic15":
-    # train_dset = FAST_IC15("train", short_size=640)
-    # train_loader = DataLoaderIterator(
-    #     train_dset, shuffle=True, batch_size=batch_size
-    # )
-    # val_dset = FAST_IC15("val", short_size=736)
-    # val_loader = DataLoaderIterator(val_dset, shuffle=True, batch_size=batch_size)
 
-    # elif cfg.data.dataset == "synthtext":
-    #     train_loader, val_loader = get_synthtext_loaders(batch_size=batch_size)
-
-    num_iterations = cfg.train.num_iterations
-    if cfg.train.train_eval_interval:
-        train_eval_interval = cfg.train.train_eval_interval
+    # training parameters
+    num_iterations = cfg["train"]["num_iterations"]
+    if cfg["train"]["train_eval_interval"]:
+        train_eval_interval = cfg["train"]["train_eval_interval"]
     else:
         train_eval_interval = len(train_loader)
-    if cfg.train.val_eval_interval:
-        val_eval_interval = cfg.train.val_eval_interval
+    if cfg["train"]["val_eval_interval"]:
+        val_eval_interval = cfg["train"]["val_eval_interval"]
     else:
         val_eval_interval = len(val_loader)
 
     # model
-    if cfg.model.type == "fast":
+    if cfg["model"]["type"] == "fast":
         model = FAST()
     model = model.cuda()
 
     # kernel loss
-    if cfg.model.kernel_loss.loss_fn == "bce_loss":
+    if cfg["model"]["kernel_loss"]["loss_fn"] == "bce_loss":
         kernel_loss_fn = BCELoss()
-    elif cfg.model.kernel_loss.loss_fn == "dice_loss":
+    elif cfg["model"]["kernel_loss"]["loss_fn"] == "dice_loss":
         kernel_loss_fn = DiceLoss()
-    elif cfg.model.kernel_loss.loss_fn == "auf_loss":
-        kernel_loss_fn = AUFLoss(gamma=cfg.model.kernel_loss.gamma)
-    kernel_ohem = cfg.model.kernel_loss.ohem
+    elif cfg["model"]["kernel_loss"]["loss_fn"] == "auf_loss":
+        kernel_loss_fn = AUFLoss(gamma=cfg["model"]["kernel_loss"]["gamma"])
+    kernel_ohem = cfg["model"]["kernel_loss"]["ohem"]
 
-    # text loss
-    if cfg.model.text_loss.loss_fn == "bce_loss":
+    # text
+    if cfg["model"]["text_loss"]["loss_fn"] == "bce_loss":
         text_loss_fn = BCELoss()
-    elif cfg.model.text_loss.loss_fn == "dice_loss":
+    elif cfg["model"]["text_loss"]["loss_fn"] == "dice_loss":
         text_loss_fn = DiceLoss()
-    elif cfg.model.text_loss.loss_fn == "auf_loss":
-        text_loss_fn = AUFLoss(gamma=cfg.model.text_loss.gamma)
-    text_ohem = cfg.model.text_loss.ohem
+    elif cfg["model"]["text_loss"]["loss_fn"] == "auf_loss":
+        text_loss_fn = AUFLoss(gamma=cfg["model"]["text_loss"]["gamma"])
+    text_ohem = cfg["model"]["text_loss"]["ohem"]
 
     # optimizer
-    if cfg.train.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr)
-    elif cfg.train.optimizer == "sgd":
+    if cfg["train"]["optimizer"] == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"])
+    elif cfg["train"]["optimizer"] == "sgd":
         optimizer = torch.optim.SGD(
             model.parameters(),
-            lr=cfg.train.lr,
+            lr=cfg["train"]["lr"],
             momentum=0.9,
             weight_decay=1e-4,
             nesterov=True,
             fused=True,
         )
 
-    # if cfg.train.schedule == "cosine_warmup":
-    #     scheduler = PretrainingScheduler(
-    #         optimizer,
-    #         total_steps=num_iterations,
-    #         warmup_steps=cfg.train.warmup_iterations,
-    #         eta_min=cfg.train.min_lr,
-    #     )
-
     # learning rate scheduler
-    if not cfg.train.warmup:
+    if not cfg["train"]["warmup"]:
         warmup_iterations = 0
     else:
         warmup = torch.optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=1e-3,
-            total_iters=cfg.train.warmup_iterations,
+            total_iters=cfg["train"]["warmup_iterations"],
         )
-        warmup_iterations = cfg.train.warmup_iterations
+        warmup_iterations = cfg["train"]["warmup_iterations"]
 
-    if cfg.train.schedule == "poly":
+    if cfg["train"]["schedule"] == "poly":
         scheduler = torch.optim.lr_scheduler.PolynomialLR(
             optimizer, power=0.9, total_iters=num_iterations - warmup_iterations
         )
-    if cfg.train.warmup:
+    if cfg["train"]["warmup"]:
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer, [warmup, scheduler], [warmup_iterations]
         )
 
-    # load checkpoint
+    # load model weights if resuming or starting from checkpoint
     iteration = 0
-    best_val_loss = float("inf")
-    if cfg.train.resume:
+    best_f1 = 0.0
+    if args.resume:
         checkpoint = torch.load(
-            osp.join("checkpoints", cfg.train.resume, "recent.pth"), weights_only=False
+            osp.join(artifact_path, "recent.pth"), weights_only=False
         )
         model.load_state_dict(checkpoint["model_state_dict"])
-        iteration = checkpoint["iteration"]
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        best_val_loss = checkpoint["best_val_loss"]
+        iteration = checkpoint["iteration"]
+        best_f1 = checkpoint["best_f1"]
+        print(f"Resuming run {run.id} at iteration {iteration}")
+    elif args.checkpoint:
+        checkpoint = torch.load(osp.join(artifact_path, "best.pth"), weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        best_f1 = checkpoint["best_f1"]
+        print(f"Loaded checkpoint {run.id}")
+    checkpoint_path = osp.join("checkpoints", run.id)
+    os.makedirs(checkpoint_path, exist_ok=True)
+    print(f"Local model directory: {checkpoint_path}")
 
-        checkpoint_path = osp.join("checkpoints", cfg.train.resume)
-        print(f"Resuming at iteration {iteration}")
-    else:
-        if cfg.train.checkpoint:
-            checkpoint = torch.load(
-                osp.join("checkpoints", cfg.train.checkpoint), weights_only=True
-            )
-            model.load_state_dict(checkpoint["model_state_dict"])
-            best_val_loss = checkpoint["best_val_loss"]
-            print(f"Loaded checkpoint {cfg.train.checkpoint}")
-
-        run_id = get_run_id("auf_loss")
-        checkpoint_path = osp.join("checkpoints", run_id)
-        os.makedirs(checkpoint_path)
-    print(f"Checkpoint path: {checkpoint_path}")
-
-    # train for num_iterations
+    # train for num_iterations or until interrupted
     while iteration < num_iterations:
         # train loop
         model.train()
@@ -266,10 +244,7 @@ def main(cfg, args):
 
         iteration += train_eval_interval
 
-        # log to wandb
-        print(
-            f"[Iter {iteration}] | train loss: {train_loss:.4f} | val loss: {val_loss:.4f} | IOU(kernel/text): {val_kernel_iou:.4f}/{val_text_iou:.4f} | lr: {scheduler.get_last_lr()[0]:.7f}"
-        )
+        # create wandb log and print
         log = {
             "train_loss": train_loss,
             "val_loss": val_loss,
@@ -280,43 +255,77 @@ def main(cfg, args):
             "kernel_iou": val_kernel_iou,
             "text_iou": val_text_iou,
         }
-
-        # save checkpoint
-        checkpoint = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "iteration": iteration,
-            "best_val_loss": best_val_loss,
-        }
-        torch.save(checkpoint, osp.join(checkpoint_path, "recent.pth"))
-        if int(iteration / train_eval_interval) % cfg.train.save_interval == 0:
-            torch.save(checkpoint, osp.join(checkpoint_path, f"{iteration}.pth"))
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(checkpoint, osp.join(checkpoint_path, "best.pth"))
+        print(
+            f"[Iter {iteration}] | train loss: {train_loss:.4f} | val loss: {val_loss:.4f} | IOU(kernel/text): {val_kernel_iou:.4f}/{val_text_iou:.4f} | lr: {scheduler.get_last_lr()[0]:.7f}"
+        )
 
         # evaluate model
-        if iteration % cfg.train.save_interval == 0:
+        if iteration % cfg["train"]["save_interval"] == 0:
             precision, recall, f1 = evaluate_micro(model, val_loader, val_eval_interval)
-            print(f"precision: {precision:.4f} | recall: {recall:.4f} | f1: {f1:.4f}")
             log["precision"] = precision
             log["recall"] = recall
             log["f1"] = f1
-
+            print(f"precision: {precision:.4f} | recall: {recall:.4f} | f1: {f1:.4f}")
+        # log metrics to wandb
         wandb.log(log)
-    wandb.finish()
+
+        # create and save recent/best checkpoints
+        if iteration % cfg["train"]["save_interval"] == 0:
+            checkpoint = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "iteration": iteration,
+                "best_f1": f1,
+            }
+
+            # save most recent checkpoint
+            save_path_recent = osp.join(checkpoint_path, "recent.pth")
+            torch.save(checkpoint, save_path_recent)
+            artifact = wandb.Artifact(
+                f"{run.id}-model-recent.pt", type="model", metadata=log
+            )
+            artifact.add_file(save_path_recent)
+            wandb.log_artifact(artifact)
+
+            # save best checkpoint if f1 improved
+            if f1 > best_f1:
+                best_f1 = f1
+                save_path_best = osp.join(checkpoint_path, "best.pth")
+                torch.save(checkpoint, save_path_best)
+                artifact = wandb.Artifact(
+                    f"{run.id}-model-best.pt", type="model", metadata=log
+                )
+                artifact.add_file(save_path_best)
+                wandb.log_artifact(artifact)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Hyperparams")
-    parser.add_argument("config", help="config file path")
-    parser.add_argument("--checkpoint", nargs="?", type=str, default=None)
-    parser.add_argument("--resume", nargs="?", type=str, default=None)
+    parser.add_argument("-c", "--config", type=str, help="config file path")
+    parser.add_argument(
+        "-r", "--resume", type=str, help="wandb resume id to resume training from"
+    )
+    parser.add_argument(
+        "-s",
+        "--checkpoint",
+        type=str,
+        help="wandb checkpoint id to start training from",
+    )
     args = parser.parse_args()
 
-    with initialize(version_base=None, config_path="config", job_name="test"):
-        cfg = compose(config_name=args.config)
+    if not args.config and not args.resume:
+        print("Error: need to specify config or resume id")
+        sys.exit(1)
+    elif args.config and args.resume:
+        print("Error: cannot specify both config and resume id")
+        sys.exit(1)
+    elif args.checkpoint and not args.config:
+        print("Error: need to specify config when starting from checkpoint")
+        sys.exit(1)
+    elif args.checkpoint and args.resume:
+        print("Error: cannot specify both checkpoint and resume id")
+        sys.exit(1)
 
     # sweep_config = {
     #     "method": "grid",
@@ -328,5 +337,4 @@ if __name__ == "__main__":
     # sweep_id = wandb.sweep(sweep=sweep_config, project="text-detection")
     # wandb.agent(sweep_id, function=main)
 
-    main(cfg, args)
-    # main()
+    main(args)

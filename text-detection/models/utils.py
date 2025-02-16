@@ -1,27 +1,27 @@
 import cv2 as cv
 import numpy as np
 from shapely.geometry import Polygon
-import pyclipper
+# import pyclipper
 import torch
 import torch.nn.functional as F
 
 
-def dilate_polygons(polygons):
-    dilated_polygons = []
-    for poly in polygons:
-        if len(poly) < 4:
-            continue
-        Gs = Polygon(poly)
-        D = Gs.area * 1.5 / Gs.length
-        pco = pyclipper.PyclipperOffset()
-        pco.AddPath(poly, pyclipper.JT_MITER, pyclipper.ET_CLOSEDPOLYGON)
+# def dilate_polygons(polygons):
+#     dilated_polygons = []
+#     for poly in polygons:
+#         if len(poly) < 4:
+#             continue
+#         Gs = Polygon(poly)
+#         D = Gs.area * 1.5 / Gs.length
+#         pco = pyclipper.PyclipperOffset()
+#         pco.AddPath(poly, pyclipper.JT_MITER, pyclipper.ET_CLOSEDPOLYGON)
 
-        dilated_polygon = pco.Execute(D)
-        if dilated_polygon == []:
-            continue
-        dilated_polygon = np.array(dilated_polygon[0]).reshape(-1, 2)
-        dilated_polygons.append(dilated_polygon)
-    return dilated_polygons
+#         dilated_polygon = pco.Execute(D)
+#         if dilated_polygon == []:
+#             continue
+#         dilated_polygon = np.array(dilated_polygon[0]).reshape(-1, 2)
+#         dilated_polygons.append(dilated_polygon)
+#     return dilated_polygons
 
 
 def seg_to_polygons(map):
@@ -45,18 +45,18 @@ def polygons_to_seg(polygons, size):
     return map
 
 
-def get_seg_and_poly(output_maps):
-    output_maps = output_maps.detach().cpu().numpy()
-    bin_maps = (output_maps >= 0.2).astype(np.uint8)
+# def get_seg_and_poly(output_maps):
+#     output_maps = output_maps.detach().cpu().numpy()
+#     bin_maps = (output_maps >= 0.2).astype(np.uint8)
 
-    gt_polygons = []
-    gt_maps = np.empty_like(bin_maps, dtype=np.float32)
-    for i, map in enumerate(bin_maps):
-        polygons = seg_to_polygons(map)
-        dilated_polygons = dilate_polygons(polygons)
-        gt_polygons.append(dilated_polygons)
-        gt_maps[i] = polygons_to_seg(dilated_polygons, (640, 640))
-    return gt_polygons, gt_maps
+#     gt_polygons = []
+#     gt_maps = np.empty_like(bin_maps, dtype=np.float32)
+#     for i, map in enumerate(bin_maps):
+#         polygons = seg_to_polygons(map)
+#         dilated_polygons = dilate_polygons(polygons)
+#         gt_polygons.append(dilated_polygons)
+#         gt_maps[i] = polygons_to_seg(dilated_polygons, (640, 640))
+#     return gt_polygons, gt_maps
 
 
 def get_components(img):
@@ -171,8 +171,11 @@ def evaluate_micro(model, loader, iter_limit=None):
     model.eval()
     with torch.no_grad():
         iter = 0
-        # while iter < iter_limit:
-        for batch in loader:
+        if not iter_limit:
+            iter_limit = len(loader)
+
+        for _ in range(iter_limit):
+            batch = next(loader)[0]
             images = batch["images"]
             training_masks = batch["training_masks"]
             gt_instances = batch["gt_instances"]

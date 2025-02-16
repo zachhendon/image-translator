@@ -21,6 +21,4 @@ train:
     schedule: poly
     warmup: true
     warmup_iterations: 5000
-    checkpoint: null
-    resume: null
 

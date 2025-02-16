@@ -1,14 +1,16 @@
 from nvidia.dali import pipeline_def, fn, types
-from nvidia.dali.auto_aug import trivial_augment, augmentations
+from nvidia.dali.auto_aug import trivial_augment, augmentations, rand_augment
 from nvidia.dali.plugin.pytorch import DALIGenericIterator
 from nvidia.dali.plugin.pytorch.fn import torch_python_function
 from nvidia.dali.plugin.base_iterator import LastBatchPolicy
 import torch
 import torch.nn.functional as F
+import kornia
 from kornia.utils import draw_convex_polygon
 from shapely.geometry import Polygon
 import math
 import time
+import numpy as np
 
 
 def fast_binary_avgpool2d(mask, kernel_size):
@@ -51,6 +53,19 @@ def pad_images(image, bboxes, ignore_bboxes):
     return image, bboxes, ignore_bboxes
 
 
+def random_flip(image, bboxes, ignore_bboxes):
+    if np.random.rand() < 0.5:
+        return image, bboxes, ignore_bboxes
+
+    w = image.shape[1]
+    image = kornia.geometry.transform.hflip(image.permute(2, 0, 1)).permute(
+        1, 2, 0
+    )
+    bboxes[:, :, 0] = w - bboxes[:, :, 0]
+    ignore_bboxes[:, :, 0] = w - ignore_bboxes[:, :, 0]
+    return image, bboxes, ignore_bboxes
+
+
 def random_crop(image, bboxes, short_size, gamma=2):
     device = image.device
     h, w = image.shape[:2]
@@ -66,13 +81,13 @@ def random_crop(image, bboxes, short_size, gamma=2):
         p += 1
     coord = torch.multinomial(p.view(-1), 1)
     y_coord, x_coord = coord // p.shape[1], coord % p.shape[1]
-    return x_coord, y_coord, p
+    return x_coord, y_coord
 
 
 def random_scale_and_crop(image, bboxes, ignore_bboxes, short_size, scale):
     crop_scale = int(short_size / scale)
 
-    start_x, start_y, p = random_crop(image, bboxes, short_size)
+    start_x, start_y = random_crop(image, bboxes, short_size)
     image = image[start_y : start_y + crop_scale, start_x : start_x + crop_scale]
     image = (
         F.interpolate(
@@ -87,12 +102,7 @@ def random_scale_and_crop(image, bboxes, ignore_bboxes, short_size, scale):
         ignore_bboxes = (
             ignore_bboxes - torch.tensor([start_x, start_y], device="cuda")
         ) * scale
-    return (
-        image,
-        bboxes,
-        ignore_bboxes,
-        # p,
-    )
+    return image, bboxes, ignore_bboxes
 
 
 def resize(images, bboxes, ignore_bboxes, train, short_size):
@@ -223,17 +233,21 @@ def data_pipeline(data_dir, train=True, short_size=640):
         shapes = fn.peek_image_shape(jpegs)
         center = shapes[1::-1] / 2
 
+        images, bboxes, ignore_bboxes = torch_python_function(
+            images, bboxes, ignore_bboxes, function=random_flip, num_outputs=3
+        )
+
         rotate = fn.transforms.rotation(
-            angle=fn.random.normal(mean=0, stddev=15), center=center
+            angle=fn.random.uniform(range=[-15, 15]), center=center
         )
         shear = fn.transforms.shear(
-            angles=fn.random.normal(mean=0, stddev=10, shape=(2,)),
-            center=center,
+            angles=fn.random.uniform(range=[-15, 15], shape=(2,)), center=center
         )
         mt = fn.transforms.combine(rotate, shear)
         images = fn.warp_affine(images, matrix=mt, fill_value=0, inverse_map=False)
         bboxes = fn.coord_transform(bboxes, MT=mt)
         ignore_bboxes = fn.coord_transform(ignore_bboxes, MT=mt)
+
 
         scale = fn.random.uniform(range=[0.5, 2.0], device="gpu")
         images, bboxes, ignore_bboxes = torch_python_function(
@@ -258,18 +272,21 @@ def data_pipeline(data_dir, train=True, short_size=640):
         )
 
         images = fn.reshape(images, layout="HWC")
-        images = trivial_augment.apply_trivial_augment(
+        images = rand_augment.apply_rand_augment(
             [
                 augmentations.brightness,
                 augmentations.contrast,
                 augmentations.color,
                 augmentations.sharpness,
-                augmentations.posterize,
                 augmentations.solarize,
                 augmentations.invert,
                 augmentations.equalize,
+                augmentations.auto_contrast,
+                augmentations.identity,
             ],
-            images,
+            data=images,
+            n=2,
+            m=np.random.randint(31),
         )
     else:
         images, bboxes, ignore_bboxes = torch_python_function(
