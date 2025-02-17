@@ -1,0 +1,26 @@
+model:
+    type: fast
+    kernel_loss: 
+        loss_fn: auf_loss
+        weight: 1
+        gamma: 0.5
+        ohem: false
+    text_loss: 
+        loss_fn: auf_loss
+        weight: 0.33
+        gamma: 0.9
+        ohem: false
+data:
+    batch_size: 16
+    dataset: synthtext
+train:
+    lr: 1e-3
+    num_iterations: 250000
+    train_interval: 250
+    val_interval: 100
+    eval_interval: 1000
+    optimizer: adamw
+    schedule: poly
+    warmup: true
+    warmup_iterations: 5000
+

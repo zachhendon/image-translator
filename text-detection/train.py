@@ -1,9 +1,10 @@
 import torch
-import torch.nn as nn
 import argparse
 import os
 import os.path as osp
-from glob import glob
+import wandb
+import sys
+import ast
 from models.utils import evaluate_micro, get_iou
 from hydra import compose, initialize
 from models.fast import FAST
@@ -11,18 +12,7 @@ from models.loss.ohem import get_ohem_masks
 from models.loss.bce_loss import BCELoss
 from models.loss.dice_loss import DiceLoss
 from models.loss.auf_loss import AUFLoss
-from tqdm import tqdm
-import time
-from torch.utils.data import DataLoader
-from loader_new import FAST_IC15, DataLoaderIterator
-import wandb
 from dali_loader import get_loader
-import sys
-import ast
-
-
-def calculate_total_loss(kernel_loss, text_loss):
-    return kernel_loss + text_loss / 3
 
 
 def main(args):
@@ -31,7 +21,9 @@ def main(args):
         with initialize(config_path="config"):
             cfg = dict(compose(config_name=args.config))
 
-        run = wandb.init(project="text-detection", config=cfg, settings=wandb.Settings(code_dir="."))
+        run = wandb.init(
+            project="text-detection", config=cfg, settings=wandb.Settings(code_dir=".")
+        )
         if args.checkpoint:
             artifact = run.use_artifact(
                 f"{args.checkpoint}-model-best.pt:latest", type="model"
@@ -42,26 +34,31 @@ def main(args):
         artifact = run.use_artifact(f"{run.id}-model-recent.pt:latest", type="model")
         artifact_path = artifact.download()
         cfg = {k: ast.literal_eval(v) for k, v in run.config.items()}
-    
+
     # data loaders
     batch_size = cfg["data"]["batch_size"]
     train_loader = get_loader(
         cfg["data"]["dataset"], "train", 640, batch_size=batch_size, num_threads=1
     )
     val_loader = get_loader(
-        cfg["data"]["dataset"], "val", 736, batch_size=batch_size, num_threads=1
+        cfg["data"]["dataset"], "val", 736, batch_size=1, num_threads=1
     )
 
     # training parameters
     num_iterations = cfg["train"]["num_iterations"]
-    if cfg["train"]["train_eval_interval"]:
-        train_eval_interval = cfg["train"]["train_eval_interval"]
+    if cfg["train"]["train_interval"]:
+        train_interval = cfg["train"]["train_interval"]
     else:
-        train_eval_interval = len(train_loader)
-    if cfg["train"]["val_eval_interval"]:
-        val_eval_interval = cfg["train"]["val_eval_interval"]
+        train_interval = len(train_loader)
+    if cfg["train"]["val_interval"]:
+        val_interval = cfg["train"]["val_interval"]
     else:
-        val_eval_interval = len(val_loader)
+        val_interval = len(val_loader)
+    val_interval *= batch_size # account for batch size of 1 in validation loader
+    eval_interval = cfg["train"]["eval_interval"]
+    if eval_interval % train_interval != 0:
+        print("Error: eval_interval must be multiple of train_interval")
+        sys.exit(1)
 
     # model
     if cfg["model"]["type"] == "fast":
@@ -75,6 +72,7 @@ def main(args):
         kernel_loss_fn = DiceLoss()
     elif cfg["model"]["kernel_loss"]["loss_fn"] == "auf_loss":
         kernel_loss_fn = AUFLoss(gamma=cfg["model"]["kernel_loss"]["gamma"])
+    kernel_weight = cfg["model"]["kernel_loss"]["weight"] or 1
     kernel_ohem = cfg["model"]["kernel_loss"]["ohem"]
 
     # text
@@ -84,6 +82,7 @@ def main(args):
         text_loss_fn = DiceLoss()
     elif cfg["model"]["text_loss"]["loss_fn"] == "auf_loss":
         text_loss_fn = AUFLoss(gamma=cfg["model"]["text_loss"]["gamma"])
+    text_weight = cfg["model"]["text_loss"]["weight"] or 1 / 3
     text_ohem = cfg["model"]["text_loss"]["ohem"]
 
     # optimizer
@@ -150,7 +149,7 @@ def main(args):
         train_text_running_loss = 0.0
         train_running_loss = 0.0
 
-        for _ in range(train_eval_interval):
+        for _ in range(train_interval):
             batch = next(train_loader)[0]
             images = batch["images"]
             gt_kernels = batch["gt_kernels"]
@@ -177,7 +176,8 @@ def main(args):
                 loss_text = text_loss_fn(dilated_preds, gt_texts, ohem_text_mask)
             else:
                 loss_text = text_loss_fn(dilated_preds, gt_texts, training_masks)
-            loss = calculate_total_loss(loss_kernel, loss_text)
+            # loss = calculate_total_loss(loss_kernel, loss_text)
+            loss = loss_kernel * kernel_weight + loss_text * text_weight
             loss.backward()
 
             optimizer.step()
@@ -186,9 +186,9 @@ def main(args):
             train_kernel_running_loss += loss_kernel.item()
             train_text_running_loss += loss_text.item()
             train_running_loss += loss.item()
-        train_kernel_loss = train_kernel_running_loss / train_eval_interval
-        train_text_loss = train_text_running_loss / train_eval_interval
-        train_loss = train_running_loss / train_eval_interval
+        train_kernel_loss = train_kernel_running_loss / train_interval
+        train_text_loss = train_text_running_loss / train_interval
+        train_loss = train_running_loss / train_interval
 
         # validation loop
         model.eval()
@@ -200,7 +200,7 @@ def main(args):
         val_running_text_iou = 0.0
 
         with torch.no_grad():
-            for _ in range(val_eval_interval):
+            for _ in range(val_interval):
                 batch = next(val_loader)[0]
                 images = batch["images"]
                 gt_kernels = batch["gt_kernels"]
@@ -227,7 +227,8 @@ def main(args):
                     loss_text = text_loss_fn(dilated_preds, gt_texts, ohem_text_mask)
                 else:
                     loss_text = text_loss_fn(dilated_preds, gt_texts, training_masks)
-                    loss = calculate_total_loss(loss_kernel, loss_text)
+                # loss = calculate_total_loss(loss_kernel, loss_text)
+                loss = loss_kernel * kernel_weight + loss_text * text_weight
 
                 val_kernel_running_loss += loss_kernel.item()
                 val_text_running_loss += loss_text.item()
@@ -236,16 +237,17 @@ def main(args):
                 val_running_kernel_iou += get_iou(preds, gt_kernels, training_masks)
                 val_running_text_iou += get_iou(dilated_preds, gt_texts, training_masks)
 
-            val_kernel_loss = val_kernel_running_loss / val_eval_interval
-            val_text_loss = val_text_running_loss / val_eval_interval
-            val_loss = val_running_loss / val_eval_interval
-            val_kernel_iou = val_running_kernel_iou / val_eval_interval
-            val_text_iou = val_running_text_iou / val_eval_interval
+            val_kernel_loss = val_kernel_running_loss / val_interval
+            val_text_loss = val_text_running_loss / val_interval
+            val_loss = val_running_loss / val_interval
+            val_kernel_iou = val_running_kernel_iou / val_interval
+            val_text_iou = val_running_text_iou / val_interval
 
-        iteration += train_eval_interval
+        iteration += train_interval
 
         # create wandb log and print
         log = {
+            "iteration": iteration,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "kernel_loss_train": train_kernel_loss,
@@ -260,8 +262,8 @@ def main(args):
         )
 
         # evaluate model
-        if iteration % cfg["train"]["save_interval"] == 0:
-            precision, recall, f1 = evaluate_micro(model, val_loader, val_eval_interval)
+        if iteration % eval_interval == 0:
+            precision, recall, f1 = evaluate_micro(model, val_loader, val_interval)
             log["precision"] = precision
             log["recall"] = recall
             log["f1"] = f1
@@ -270,7 +272,7 @@ def main(args):
         wandb.log(log)
 
         # create and save recent/best checkpoints
-        if iteration % cfg["train"]["save_interval"] == 0:
+        if iteration % eval_interval == 0:
             checkpoint = {
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -326,15 +328,5 @@ if __name__ == "__main__":
     elif args.checkpoint and args.resume:
         print("Error: cannot specify both checkpoint and resume id")
         sys.exit(1)
-
-    # sweep_config = {
-    #     "method": "grid",
-    #     "metric": {"name": "f1", "goal": "minimize"},
-    #     "parameters": {
-    #         "auf_gamma": {"values": [0.9, 0.1, 0.5, 0.7, 0.3]},
-    #     },
-    # }
-    # sweep_id = wandb.sweep(sweep=sweep_config, project="text-detection")
-    # wandb.agent(sweep_id, function=main)
 
     main(args)

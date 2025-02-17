@@ -10,8 +10,6 @@ from shapely.geometry import Polygon
 from sklearn.model_selection import train_test_split
 from scipy.io import loadmat
 
-# import pyclipper
-
 
 def create_masks(bboxes, size):
     gt_kernels = []
@@ -56,18 +54,18 @@ def get_min_bboxes(bboxes):
     return np.array(shrunk_bboxes).reshape(-1, 4, 2).astype(np.int32)
 
 
-def process_ic15_data(image_paths, gt_paths, subdir):
-    os.makedirs(subdir, exist_ok=True)
-    images_dir = f"{subdir}/images"
-    bboxes_dir = f"{subdir}/bboxes"
-    min_bboxes_dir = f"{subdir}/min_bboxes"
-    ignore_bboxes_dir = f"{subdir}/ignore_bboxes"
-    min_ignore_bboxes_dir = f"{subdir}/min_ignore_bboxes"
+def process_ic15_data(image_paths, gt_paths, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    images_dir = f"{save_dir}/images"
+    bboxes_dir = f"{save_dir}/bboxes"
+    # min_bboxes_dir = f"{save_dir}/min_bboxes"
+    ignore_bboxes_dir = f"{save_dir}/ignore_bboxes"
+    # min_ignore_bboxes_dir = f"{save_dir}/min_ignore_bboxes"
     os.makedirs(images_dir, exist_ok=True)
     os.makedirs(bboxes_dir, exist_ok=True)
-    os.makedirs(min_bboxes_dir, exist_ok=True)
+    # os.makedirs(min_bboxes_dir, exist_ok=True)
     os.makedirs(ignore_bboxes_dir, exist_ok=True)
-    os.makedirs(min_ignore_bboxes_dir, exist_ok=True)
+    # os.makedirs(min_ignore_bboxes_dir, exist_ok=True)
     for i, (image_path, gt_path) in tqdm(enumerate(zip(image_paths, gt_paths))):
         id = str(i).zfill(6)
         image = cv.imread(image_path, cv.IMREAD_UNCHANGED)
@@ -83,29 +81,6 @@ def process_ic15_data(image_paths, gt_paths, subdir):
                     bboxes.append([gt[:8]])
         bboxes = np.array(bboxes, dtype=np.float32).reshape(-1, 4, 2)
         ignore_bboxes = np.array(ignore_bboxes, dtype=np.float32).reshape(-1, 4, 2)
-
-        # # pad images and bboxes to square
-        # h, w = image.shape[:2]
-        # if h > w:
-        #     # pad = (h - w) // 2
-        #     pad_left = (h - w) // 2
-        #     pad_right = (h - w) - pad_left
-        #     image = np.pad(
-        #         image,
-        #         ((0, 0), (pad_left, pad_right), (0, 0)),
-        #         mode="constant",
-        #         constant_values=0,
-        #     )
-        #     bboxes[:, :, 0] += pad_left
-        #     ignore_bboxes[:, :, 0] += pad_left
-        # elif w > h:
-        #     pad_top = (w - h) // 2
-        #     pad_bottom = (w - h) - pad_top
-        #     image = np.pad(
-        #         image, ((pad_top, pad_bottom), (0, 0), (0, 0)), mode="constant", constant_values=0
-        #     )
-        #     bboxes[:, :, 1] += pad_top
-        #     ignore_bboxes[:, :, 1] += pad_top
 
         cv.imwrite(f"{images_dir}/{id}.jpg", image)
         np.save(f"{bboxes_dir}/{id}.npy", bboxes)
@@ -140,46 +115,45 @@ def process_ic15():
     process_ic15_data(test_image_paths, test_gt_paths, test_save_dir)
 
 
-def process_synthtext_data(image_paths, bboxes, subdir):
-    os.makedirs(subdir, exist_ok=True)
-    images_dir = f"{subdir}/images"
-    bboxes_dir = f"{subdir}/bboxes"
-    min_bboxes_dir = f"{subdir}/min_bboxes"
+def process_synthtext_data(image_paths, bboxes, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    images_dir = f"{save_dir}/images"
+    bboxes_dir = f"{save_dir}/bboxes"
+    ignore_bboxes_dir = f"{save_dir}/ignore_bboxes"
     os.makedirs(images_dir, exist_ok=True)
     os.makedirs(bboxes_dir, exist_ok=True)
-    os.makedirs(min_bboxes_dir, exist_ok=True)
+    os.makedirs(ignore_bboxes_dir, exist_ok=True)
 
-    for i, (image_path, bbox) in enumerate(tqdm(zip(image_paths, bboxes))):
+    for i, (image_path, bbox) in tqdm(enumerate(zip(image_paths, bboxes))):
         id = str(i).zfill(6)
-        image = cv.imread(image_path)
+        image = cv.imread(image_path, cv.IMREAD_UNCHANGED)
+
         cv.imwrite(f"{images_dir}/{id}.jpg", image)
-
-        min_bbox = get_min_bboxes(bbox)
-        torch.save(torch.from_numpy(bbox).float(), f"{bboxes_dir}/{id}.pt")
-        torch.save(torch.from_numpy(min_bbox).float(), f"{min_bboxes_dir}/{id}.pt")
+        np.save(f"{bboxes_dir}/{id}.npy", bbox)
+        np.save(f"{ignore_bboxes_dir}/{id}.npy", np.array([]).reshape(0, 4, 2))
 
 
-def process_synthtext(save_dir):
+def process_synthtext():
     data = loadmat("data/raw/synthtext/gt.mat")
     indices = list(range(data["imnames"].shape[1]))
     train_indices, val_indices = train_test_split(
-        indices, test_size=0.1, random_state=42
+        indices, test_size=0.05, random_state=42
     )
 
-    train_img_paths = [
+    train_image_paths = [
         f"data/raw/synthtext/{data["imnames"][0, i].item()}" for i in train_indices
     ]
-    val_img_paths = [
+    val_image_paths = [
         f"data/raw/synthtext/{data["imnames"][0, i].item()}" for i in val_indices
     ]
     train_bboxes = [data["wordBB"][0, i].T.reshape(-1, 4, 2) for i in train_indices]
     val_bboxes = [data["wordBB"][0, i].T.reshape(-1, 4, 2) for i in val_indices]
 
-    train_subdir = f"{save_dir}/train"
-    val_subdir = f"{save_dir}/val"
+    train_save_dir = f"data/processed/synthtext/train"
+    val_save_dir = f"data/processed/synthtext/val"
 
-    process_synthtext_data(train_img_paths, train_bboxes, train_subdir)
-    process_synthtext_data(val_img_paths, val_bboxes, val_subdir)
+    process_synthtext_data(train_image_paths, train_bboxes, train_save_dir)
+    process_synthtext_data(val_image_paths, val_bboxes, val_save_dir)
 
 
 if __name__ == "__main__":
