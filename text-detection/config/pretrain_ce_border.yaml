@@ -1,0 +1,17 @@
+model:
+    type: fast
+    loss_fn: ce_border
+data:
+    batch_size: 16
+    dataset: synthtext
+train:
+    lr: 5e-3
+    num_iterations: 500000
+    train_interval: 500
+    val_interval: 100
+    optimizer: adamw
+    schedule: poly
+    warmup_iterations: 5000
+eval:
+    threshold: 0.88
+    eval_interval: 2500

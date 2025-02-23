@@ -1,6 +1,7 @@
 import cv2 as cv
 import numpy as np
 from shapely.geometry import Polygon
+
 # import pyclipper
 import torch
 import torch.nn.functional as F
@@ -137,8 +138,8 @@ def blur_image(image):
     )
 
 
-def get_metrics_micro(pred, text_masks, ignore_text_masks):
-    threshold = 0.88
+def get_metrics_micro(pred, text_masks, ignore_text_masks, threshold):
+    # threshold = 0.88
 
     total_tp = 0
     total_fp = 0
@@ -163,7 +164,7 @@ def get_metrics_micro(pred, text_masks, ignore_text_masks):
     return total_tp, total_fp, total_fn
 
 
-def evaluate_micro(model, loader, iter_limit=None):
+def evaluate_micro(model, loader, threshold=0.88, iter_limit=None):
     num_tp = 0
     num_fp = 0
     num_fn = 0
@@ -180,9 +181,9 @@ def evaluate_micro(model, loader, iter_limit=None):
             training_masks = batch["training_masks"]
             gt_instances = batch["gt_instances"]
 
-            preds = model(images)
+            preds = model(images)[:, 0]
             true_positives, false_positives, false_negatives = get_metrics_micro(
-                preds, gt_instances, training_masks
+                preds, gt_instances, training_masks, threshold
             )
             num_tp += true_positives
             num_fp += false_positives

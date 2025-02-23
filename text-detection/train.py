@@ -12,13 +12,15 @@ from models.loss.ohem import get_ohem_masks
 from models.loss.bce_loss import BCELoss
 from models.loss.dice_loss import DiceLoss
 from models.loss.auf_loss import AUFLoss
+from models.loss.weighted_cross_entropy import WeightedCrossEntropyLoss
+from models.loss.ce_border import CEBorderLoss
 from dali_loader import get_loader
 
 
 def main(args):
     # load config and download model artifacts from wandb
     if args.config:
-        with initialize(config_path="config"):
+        with initialize(config_path="config", version_base=None):
             cfg = dict(compose(config_name=args.config))
 
         run = wandb.init(
@@ -29,6 +31,8 @@ def main(args):
                 f"{args.checkpoint}-model-best.pt:latest", type="model"
             )
             artifact_path = artifact.download()
+        else:
+            wandb.run.log_code(".")
     else:
         run = wandb.init(project="text-detection", resume="must", id=args.resume)
         artifact = run.use_artifact(f"{run.id}-model-recent.pt:latest", type="model")
@@ -54,8 +58,8 @@ def main(args):
         val_interval = cfg["train"]["val_interval"]
     else:
         val_interval = len(val_loader)
-    val_interval *= batch_size # account for batch size of 1 in validation loader
-    eval_interval = cfg["train"]["eval_interval"]
+    val_interval *= batch_size  # account for batch size of 1 in validation loader
+    eval_interval = cfg["eval"]["eval_interval"]
     if eval_interval % train_interval != 0:
         print("Error: eval_interval must be multiple of train_interval")
         sys.exit(1)
@@ -65,25 +69,43 @@ def main(args):
         model = FAST()
     model = model.cuda()
 
-    # kernel loss
-    if cfg["model"]["kernel_loss"]["loss_fn"] == "bce_loss":
-        kernel_loss_fn = BCELoss()
-    elif cfg["model"]["kernel_loss"]["loss_fn"] == "dice_loss":
-        kernel_loss_fn = DiceLoss()
-    elif cfg["model"]["kernel_loss"]["loss_fn"] == "auf_loss":
-        kernel_loss_fn = AUFLoss(gamma=cfg["model"]["kernel_loss"]["gamma"])
-    kernel_weight = cfg["model"]["kernel_loss"]["weight"] or 1
-    kernel_ohem = cfg["model"]["kernel_loss"]["ohem"]
+    # # kernel loss
+    # kernel_loss_str = cfg["model"]["kernel_loss"]["loss_fn"]
+    # if kernel_loss_str == "bce_loss":
+    #     kernel_loss_fn = BCELoss()
+    # elif kernel_loss_str == "dice_loss":
+    #     kernel_loss_fn = DiceLoss()
+    # elif kernel_loss_str == "auf_loss":
+    #     kernel_loss_fn = AUFLoss(gamma=cfg["model"]["kernel_loss"]["gamma"])
+    # elif kernel_loss_str == "cross_entropy":
+    #     kernel_loss_fn = WeightedCrossEntropyLoss()
+    # else:
+    #     print(f"Error: kernel loss function {kernel_loss_str} not recognized")
+    #     sys.exit(1)
+    # kernel_weight = cfg["model"]["kernel_loss"]["weight"] or 1
+    # kernel_ohem = cfg["model"]["kernel_loss"]["ohem"]
 
-    # text
-    if cfg["model"]["text_loss"]["loss_fn"] == "bce_loss":
-        text_loss_fn = BCELoss()
-    elif cfg["model"]["text_loss"]["loss_fn"] == "dice_loss":
-        text_loss_fn = DiceLoss()
-    elif cfg["model"]["text_loss"]["loss_fn"] == "auf_loss":
-        text_loss_fn = AUFLoss(gamma=cfg["model"]["text_loss"]["gamma"])
-    text_weight = cfg["model"]["text_loss"]["weight"] or 1 / 3
-    text_ohem = cfg["model"]["text_loss"]["ohem"]
+    # # text loss
+    # text_loss_str = cfg["model"]["text_loss"]["loss_fn"]
+    # if text_loss_str == "bce_loss":
+    #     text_loss_fn = BCELoss()
+    # elif text_loss_str == "dice_loss":
+    #     text_loss_fn = DiceLoss()
+    # elif text_loss_str == "auf_loss":
+    #     text_loss_fn = AUFLoss(gamma=cfg["model"]["text_loss"]["gamma"])
+    # elif text_loss_str == "cross_entropy":
+    #     text_loss_fn = WeightedCrossEntropyLoss()
+    # else:
+    #     print(f"Error: text loss function {text_loss_str} not recognized")
+    #     sys.exit(1)
+    # text_weight = cfg["model"]["text_loss"]["weight"] or 1
+    # text_ohem = cfg["model"]["text_loss"]["ohem"]
+    
+    if cfg["model"]["loss_fn"] == "ce_border":
+        loss_fn = CEBorderLoss()
+    else:
+        print(f"Error: loss function {cfg['model']['loss_fn']} not recognized")
+        sys.exit(1)
 
     # optimizer
     if cfg["train"]["optimizer"] == "adamw":
@@ -99,7 +121,7 @@ def main(args):
         )
 
     # learning rate scheduler
-    if not cfg["train"]["warmup"]:
+    if not cfg["train"]["warmup_iterations"]:
         warmup_iterations = 0
     else:
         warmup = torch.optim.lr_scheduler.LinearLR(
@@ -113,7 +135,7 @@ def main(args):
         scheduler = torch.optim.lr_scheduler.PolynomialLR(
             optimizer, power=0.9, total_iters=num_iterations - warmup_iterations
         )
-    if cfg["train"]["warmup"]:
+    if cfg["train"]["warmup_iterations"]:
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer, [warmup, scheduler], [warmup_iterations]
         )
@@ -140,13 +162,16 @@ def main(args):
     os.makedirs(checkpoint_path, exist_ok=True)
     print(f"Local model directory: {checkpoint_path}")
 
+    # get binarization threshold for evaluation
+    threshold = cfg["eval"]["threshold"]
+
     # train for num_iterations or until interrupted
     while iteration < num_iterations:
         # train loop
         model.train()
         torch.cuda.empty_cache()
-        train_kernel_running_loss = 0.0
-        train_text_running_loss = 0.0
+        # train_kernel_running_loss = 0.0
+        # train_text_running_loss = 0.0
         train_running_loss = 0.0
 
         for _ in range(train_interval):
@@ -166,35 +191,36 @@ def main(args):
                 padding=4,
             )
 
-            if kernel_ohem:
-                ohem_kernel_mask = get_ohem_masks(preds, gt_kernels, training_masks)
-                loss_kernel = kernel_loss_fn(preds, gt_kernels, ohem_kernel_mask)
-            else:
-                loss_kernel = kernel_loss_fn(preds, gt_kernels, training_masks)
-            if text_ohem:
-                ohem_text_mask = get_ohem_masks(dilated_preds, gt_texts, training_masks)
-                loss_text = text_loss_fn(dilated_preds, gt_texts, ohem_text_mask)
-            else:
-                loss_text = text_loss_fn(dilated_preds, gt_texts, training_masks)
+            # if kernel_ohem:
+            #     ohem_kernel_mask = get_ohem_masks(preds, gt_kernels, training_masks)
+            #     loss_kernel = kernel_loss_fn(preds, gt_kernels, ohem_kernel_mask)
+            # else:
+            #     loss_kernel = kernel_loss_fn(preds, gt_kernels, training_masks)
+            # if text_ohem:
+            #     ohem_text_mask = get_ohem_masks(dilated_preds, gt_texts, training_masks)
+            #     loss_text = text_loss_fn(dilated_preds, gt_texts, ohem_text_mask)
+            # else:
+            #     loss_text = text_loss_fn(dilated_preds, gt_texts, training_masks)
             # loss = calculate_total_loss(loss_kernel, loss_text)
-            loss = loss_kernel * kernel_weight + loss_text * text_weight
+            # loss = loss_kernel * kernel_weight + loss_text * text_weight
+            loss = loss_fn(preds, gt_kernels, gt_texts, training_masks)
             loss.backward()
 
             optimizer.step()
             scheduler.step()
 
-            train_kernel_running_loss += loss_kernel.item()
-            train_text_running_loss += loss_text.item()
+            # train_kernel_running_loss += loss_kernel.item()
+            # train_text_running_loss += loss_text.item()
             train_running_loss += loss.item()
-        train_kernel_loss = train_kernel_running_loss / train_interval
-        train_text_loss = train_text_running_loss / train_interval
+        # train_kernel_loss = train_kernel_running_loss / train_interval
+        # train_text_loss = train_text_running_loss / train_interval
         train_loss = train_running_loss / train_interval
 
         # validation loop
         model.eval()
         torch.cuda.empty_cache()
-        val_kernel_running_loss = 0.0
-        val_text_running_loss = 0.0
+        # val_kernel_running_loss = 0.0
+        # val_text_running_loss = 0.0
         val_running_loss = 0.0
         val_running_kernel_iou = 0.0
         val_running_text_iou = 0.0
@@ -215,30 +241,31 @@ def main(args):
                     padding=4,
                 )
 
-                if kernel_ohem:
-                    ohem_kernel_mask = get_ohem_masks(preds, gt_kernels, training_masks)
-                    loss_kernel = kernel_loss_fn(preds, gt_kernels, ohem_kernel_mask)
-                else:
-                    loss_kernel = kernel_loss_fn(preds, gt_kernels, training_masks)
-                if text_ohem:
-                    ohem_text_mask = get_ohem_masks(
-                        dilated_preds, gt_texts, training_masks
-                    )
-                    loss_text = text_loss_fn(dilated_preds, gt_texts, ohem_text_mask)
-                else:
-                    loss_text = text_loss_fn(dilated_preds, gt_texts, training_masks)
-                # loss = calculate_total_loss(loss_kernel, loss_text)
-                loss = loss_kernel * kernel_weight + loss_text * text_weight
+                # if kernel_ohem:
+                #     ohem_kernel_mask = get_ohem_masks(preds, gt_kernels, training_masks)
+                #     loss_kernel = kernel_loss_fn(preds, gt_kernels, ohem_kernel_mask)
+                # else:
+                #     loss_kernel = kernel_loss_fn(preds, gt_kernels, training_masks)
+                # if text_ohem:
+                #     ohem_text_mask = get_ohem_masks(
+                #         dilated_preds, gt_texts, training_masks
+                #     )
+                #     loss_text = text_loss_fn(dilated_preds, gt_texts, ohem_text_mask)
+                # else:
+                #     loss_text = text_loss_fn(dilated_preds, gt_texts, training_masks)
+                # # loss = calculate_total_loss(loss_kernel, loss_text)
+                # loss = loss_kernel * kernel_weight + loss_text * text_weight
+                loss = loss_fn(preds, gt_kernels, gt_texts, training_masks)
 
-                val_kernel_running_loss += loss_kernel.item()
-                val_text_running_loss += loss_text.item()
+                # val_kernel_running_loss += loss_kernel.item()
+                # val_text_running_loss += loss_text.item()
                 val_running_loss += loss.item()
 
-                val_running_kernel_iou += get_iou(preds, gt_kernels, training_masks)
-                val_running_text_iou += get_iou(dilated_preds, gt_texts, training_masks)
+                val_running_kernel_iou += get_iou(preds[:, 0], gt_kernels, training_masks)
+                val_running_text_iou += get_iou(dilated_preds[:, 0], gt_texts, training_masks)
 
-            val_kernel_loss = val_kernel_running_loss / val_interval
-            val_text_loss = val_text_running_loss / val_interval
+            # val_kernel_loss = val_kernel_running_loss / val_interval
+            # val_text_loss = val_text_running_loss / val_interval
             val_loss = val_running_loss / val_interval
             val_kernel_iou = val_running_kernel_iou / val_interval
             val_text_iou = val_running_text_iou / val_interval
@@ -250,10 +277,10 @@ def main(args):
             "iteration": iteration,
             "train_loss": train_loss,
             "val_loss": val_loss,
-            "kernel_loss_train": train_kernel_loss,
-            "kernel_loss_val": val_kernel_loss,
-            "text_loss_train": train_text_loss,
-            "text_loss_val": val_text_loss,
+            # "kernel_loss_train": train_kernel_loss,
+            # "kernel_loss_val": val_kernel_loss,
+            # "text_loss_train": train_text_loss,
+            # "text_loss_val": val_text_loss,
             "kernel_iou": val_kernel_iou,
             "text_iou": val_text_iou,
         }
@@ -263,7 +290,9 @@ def main(args):
 
         # evaluate model
         if iteration % eval_interval == 0:
-            precision, recall, f1 = evaluate_micro(model, val_loader, val_interval)
+            precision, recall, f1 = evaluate_micro(
+                model, val_loader, threshold=threshold, iter_limit=val_interval
+            )
             log["precision"] = precision
             log["recall"] = recall
             log["f1"] = f1

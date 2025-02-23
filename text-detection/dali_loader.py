@@ -81,10 +81,37 @@ def random_crop(image, bboxes, crop_size, gamma=2):
     return x_coord, y_coord
 
 
-def random_scale_and_crop(image, bboxes, ignore_bboxes, crop_size, scale):
+def random_scale_and_crop(image, bboxes, ignore_bboxes, crop_size):
+    if np.random.rand() < 0.5:
+        scale = np.random.uniform(0.5, 1)
+    else:
+        scale = np.random.uniform(1, 2)
     crop_scale = int(crop_size / scale)
 
-    start_x, start_y = random_crop(image, bboxes, crop_size)
+    # pad image if necessary for crop
+    h, w = image.shape[:2]
+    pad_top = 0
+    pad_bottom = 0
+    pad_left = 0
+    pad_right = 0
+    if h < crop_scale:
+        pad_top = np.random.randint(0, crop_scale - h)
+        pad_bottom = crop_scale - h - pad_top
+    if w < crop_scale:
+        pad_left = np.random.randint(0, crop_scale - w)
+        pad_right = crop_scale - w - pad_left
+    image = F.pad(
+        image.permute(2, 0, 1),
+        (pad_left, pad_right, pad_top, pad_bottom),
+    ).permute(1, 2, 0)
+    bbox_offset = torch.tensor([[pad_left, pad_top]], device="cuda")
+    if bboxes.numel() > 0:
+        bboxes += bbox_offset
+    if ignore_bboxes.numel() > 0:
+        ignore_bboxes += bbox_offset
+
+    # crop image
+    start_x, start_y = random_crop(image, bboxes, crop_scale)
     image = image[start_y : start_y + crop_scale, start_x : start_x + crop_scale]
     image = (
         F.interpolate(
@@ -114,7 +141,7 @@ def resize(images, bboxes, ignore_bboxes, train, short_size):
             resize_h = math.ceil((h * short_size / w) / 4) * 4
             resize_w = short_size
 
-    bbox_scale = torch.tensor([resize_h / h, resize_w / w], device="cuda")
+    bbox_scale = torch.tensor([resize_w / w, resize_h / h], device="cuda")
     images = (
         F.interpolate(images.permute(2, 0, 1).unsqueeze(0), size=(resize_h, resize_w))
         .squeeze(0)
@@ -167,13 +194,13 @@ def generate_masks(image, bboxes, ignore_bboxes):
         gt_text = torch.clamp(gt_instances, max=1)
 
         # create gt kernels
-        overlap = (gt_kernels.sum(axis=0) > 1).to(dtype=torch.float16).unsqueeze(0)
-        overlap = F.max_pool2d(overlap, kernel_size=3, stride=1, padding=1)
+        # overlap = (gt_kernels.sum(axis=0) > 1).to(dtype=torch.float16).unsqueeze(0)
+        # overlap = F.max_pool2d(overlap, kernel_size=3, stride=1, padding=1)
         gt_kernels = -F.max_pool2d(
             -gt_kernels.to(dtype=torch.float16), kernel_size=9, stride=1, padding=4
         ).to(dtype=torch.uint8)
         gt_kernels = torch.max(gt_kernels, dim=0)[0].unsqueeze(0)
-        gt_kernels[overlap > 0] = 0
+        # gt_kernels[overlap > 0] = 0
 
         gt_kernels_min = torch.zeros((len(bboxes), 1, h, w), device="cuda")
         gt_kernels_min = draw_convex_polygon(
@@ -252,13 +279,11 @@ def data_pipeline(data_dir, train=True, short_size=640):
         bboxes = fn.coord_transform(bboxes, MT=mt)
         ignore_bboxes = fn.coord_transform(ignore_bboxes, MT=mt)
 
-        scale = fn.random.uniform(range=[0.5, 2.0], device="gpu")
         images, bboxes, ignore_bboxes = torch_python_function(
             images,
             bboxes,
             ignore_bboxes,
             crop_size,
-            scale,
             function=random_scale_and_crop,
             num_outputs=3,
             batch_processing=False,

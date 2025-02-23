@@ -135,8 +135,9 @@ class Head(nn.Module):
             nn.ConvTranspose2d(128, 128, 2, 2),
             nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.ConvTranspose2d(128, 1, 2, 2),
-            nn.Sigmoid(),
+            nn.ConvTranspose2d(128, 3, 2, 2),
+            nn.Softmax(dim=1),
+            # nn.Sigmoid(),
         )
 
     def forward(self, x):

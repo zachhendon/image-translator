@@ -1,0 +1,25 @@
+model:
+    type: fast
+    kernel_loss:
+        loss_fn: cross_entropy
+        weight: 1
+        ohem: false
+    text_loss:
+        loss_fn: cross_entropy
+        weight: 0.5
+        ohem: false
+data:
+    batch_size: 16
+    dataset: synthtext
+train:
+    lr: 5e-3
+    num_iterations: 500000
+    train_interval: 250
+    val_interval: 100
+    eval_interval: 1000
+    optimizer: sgd
+    schedule: poly
+    warmup: true
+    warmup_iterations: 5000
+eval:
+    threshold: 0.88
